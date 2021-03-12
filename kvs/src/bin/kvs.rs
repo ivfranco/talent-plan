@@ -1,3 +1,4 @@
+use kvs::{KvStore, Result};
 use pico_args::Arguments;
 use std::{fmt::Display, process};
 
@@ -9,7 +10,7 @@ fn main() {
         return;
     }
 
-    if args.contains("-V") {
+    if args.contains(["-V", "--version"]) {
         version();
         return;
     }
@@ -20,40 +21,67 @@ fn main() {
         Err(e) => error_exit(e),
     };
 
+    if let Err(err) = run_command(&sub, &mut args) {
+        error_exit(err);
+    };
+}
+
+fn run_command(sub: &str, args: &mut Arguments) -> Result<()> {
     const MISSING_KEY: &str = "missing storage key";
     const MISSING_VALUE: &str = "missing storage value";
 
-    match sub.as_str() {
+    let mut kv_store = KvStore::open(std::env::current_dir()?)?;
+    match sub {
         "get" => {
-            let key = free_arg(&mut args, MISSING_KEY);
-            eprintln!("unimplemented");
-            process::exit(1);
+            let key = free_arg_or(args, MISSING_KEY);
+            no_more_args(args);
+
+            let value = kv_store.get(key)?;
+            if let Some(value) = value {
+                print!("{}", value);
+            } else {
+                print!("Key not found");
+            }
         }
         "set" => {
-            let key = free_arg(&mut args, MISSING_KEY);
-            let value = free_arg(&mut args, MISSING_VALUE);
-            eprintln!("unimplemented");
-            process::exit(1);
+            let key = free_arg_or(args, MISSING_KEY);
+            let value = free_arg_or(args, MISSING_VALUE);
+            no_more_args(args);
+
+            kv_store.set(key, value)?;
         }
         "rm" => {
-            let key = free_arg(&mut args, MISSING_KEY);
-            eprintln!("unimplemented");
-            process::exit(1);
+            let key = free_arg_or(args, MISSING_KEY);
+            no_more_args(args);
+
+            kv_store.remove(key)?;
         }
         _ => error_exit("unknown subcommand"),
     }
+
+    Ok(())
 }
 
-fn free_arg<T: Display>(args: &mut Arguments, err: T) -> String {
-    if let Ok(arg) = args.free_from_str() {
-        arg
-    } else {
-        error_exit(err);
+fn no_more_args(args: &mut Arguments) {
+    if free_arg(args).is_some() {
+        error_exit("extra arguments");
     }
 }
 
+fn free_arg(args: &mut Arguments) -> Option<String> {
+    match args.free_from_str() {
+        Ok(arg) => Some(arg),
+        Err(pico_args::Error::MissingArgument) => None,
+        Err(e) => error_exit(e),
+    }
+}
+
+fn free_arg_or<T: Display>(args: &mut Arguments, err: T) -> String {
+    free_arg(args).unwrap_or_else(|| error_exit(err))
+}
+
 fn error_exit<T: Display>(err: T) -> ! {
-    eprintln!("{}: {}", env!("CARGO_PKG_NAME"), err);
+    print!("{}", err);
     eprintln!(
         "Try '{} --help' for more information.",
         env!("CARGO_PKG_NAME")
@@ -79,8 +107,8 @@ USAGE:
     kvs [FLAGS] [SUBCOMMAND]
 
 FLAGS:
-    -V              Prints version information
-    -h, --help      Prints this message 
+    -h, --help          Prints this message 
+    -V, --version       Prints version information
 
 SUBCOMMAND:
     set <KEY> <VALUE>   Set the value of a string key to a string

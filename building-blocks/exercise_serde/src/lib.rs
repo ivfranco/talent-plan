@@ -84,7 +84,7 @@ mod tests {
             }
             file.seek(SeekFrom::Start(0))?;
             // the function from_reader doesn't require a Seek or BufRead impl
-            // the deserializer maintains the correct file offsets by reading just enough bytes
+            // means the deserializer maintains the correct file offsets by reading just enough bytes
             let de_moves = (0..ser_moves.len())
                 .map(|_| bson::Document::from_reader(&mut file).and_then(bson::from_document))
                 .collect::<Result<Vec<Move>, _>>()?;
