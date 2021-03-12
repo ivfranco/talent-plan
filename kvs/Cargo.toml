@@ -1,0 +1,22 @@
+[package]
+name = "kvs"
+version = "0.1.0"
+authors = ["ivfranco <ivfranco33@protonmail.com>"]
+description = "A key-value store"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+test = false
+
+[[bin]]
+name = "kvs"
+test = false
+doctest = false
+
+[dev-dependencies]
+assert_cmd = "1.0.3"
+predicates = "1.0.7"
+
+[dependencies]
+pico-args = "0.4.0"
