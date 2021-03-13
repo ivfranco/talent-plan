@@ -4,10 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap},
     fmt::Debug,
     fs::{File, OpenOptions},
-    io::{BufWriter, Seek, SeekFrom},
+    io::{BufWriter, Seek, SeekFrom, Write},
     path::PathBuf,
 };
 use thiserror::Error;
@@ -50,7 +50,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// commands are serialized to JSON for readability.
 pub struct KvStore {
     handle: BufWriter<File>,
-    indices: Option<HashMap<String, u64>>,
+    indices: Option<Indices>,
+    dir: PathBuf,
 }
 
 const STORE_NAME: &str = "0.kvs";
@@ -64,12 +65,12 @@ impl KvStore {
     /// # use kvs::KvStore;
     /// let mut store = KvStore::open(std::env::temp_dir());
     /// ```
-    pub fn open<P: Into<PathBuf>>(path: P) -> Result<Self> {
-        let mut path: PathBuf = path.into();
-        if !path.is_dir() {
-            return Err(Error::NotDirectory(path));
+    pub fn open<P: Into<PathBuf>>(dir: P) -> Result<Self> {
+        let dir: PathBuf = dir.into();
+        if !dir.is_dir() {
+            return Err(Error::NotDirectory(dir));
         }
-        path = path.join(STORE_NAME);
+        let path = dir.join(STORE_NAME);
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -82,6 +83,7 @@ impl KvStore {
         Ok(Self {
             handle: BufWriter::new(file),
             indices: None,
+            dir,
         })
     }
 
@@ -100,6 +102,7 @@ impl KvStore {
         let pos = self.pos()?;
         self.append(&Command::Set(key.clone(), value))?;
         self.indices()?.insert(key, pos);
+        self.compact()?;
         Ok(())
     }
 
@@ -117,7 +120,7 @@ impl KvStore {
     /// ```
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         let value_pos = if let Some(pos) = self.indices()?.get(&key) {
-            *pos
+            pos
         } else {
             return Ok(None);
         };
@@ -147,6 +150,7 @@ impl KvStore {
         } else {
             self.append(&Command::Remove(key.clone()))?;
             self.indices()?.remove(&key);
+            self.compact()?;
             Ok(())
         }
     }
@@ -161,7 +165,7 @@ impl KvStore {
             .map_err(From::from)
     }
 
-    fn indices(&mut self) -> Result<&mut HashMap<String, u64>> {
+    fn indices(&mut self) -> Result<&mut Indices> {
         if self.indices.is_none() {
             self.indices = Some(self.build_indices()?);
         }
@@ -170,13 +174,13 @@ impl KvStore {
         Ok(self.indices.as_mut().unwrap())
     }
 
-    fn build_indices(&mut self) -> Result<HashMap<String, u64>> {
+    fn build_indices(&mut self) -> Result<Indices> {
         // BufWriter::seek always flushes the internal buffer
         self.handle.seek(SeekFrom::Start(0))?;
 
         let file = self.handle.get_mut();
         let mut de = serde_json::Deserializer::from_reader(file).into_iter();
-        let mut indices: HashMap<String, u64> = HashMap::new();
+        let mut indices = Indices::new();
 
         loop {
             let pos = de.byte_offset() as u64;
@@ -201,8 +205,7 @@ impl KvStore {
     // consequence other public methods must seek to the end of the file on
     // exit.
     fn append(&mut self, command: &Command) -> Result<()> {
-        serde_json::to_writer(&mut self.handle, command)?;
-        Ok(())
+        append(&mut self.handle, command)
     }
 
     fn read_from(&mut self, pos: u64) -> Result<Command> {
@@ -237,6 +240,86 @@ impl KvStore {
     }
 
     fn compact(&mut self) -> Result<()> {
-        unimplemented!()
+        Ok(())
+    }
+}
+
+fn append<W: Write>(writer: W, command: &Command) -> Result<()> {
+    serde_json::to_writer(writer, command)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Default)]
+struct Stats {
+    logs: u32,
+    values: u32,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn update(&mut self, is_overwrite: bool) {
+        if !is_overwrite {
+            self.values += 1;
+        }
+        self.logs += 1;
+    }
+
+    fn utilization(&self) -> f64 {
+        self.values as f64 / self.logs as f64
+    }
+
+    fn should_compact(&self) -> bool {
+        self.utilization() < 0.25 && self.logs >= 100_000
+    }
+}
+
+type Revision = u32;
+
+#[derive(Default)]
+struct Indices {
+    inner: HashMap<String, (Option<u64>, Revision)>,
+    stats: Stats,
+}
+
+impl Indices {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert(&mut self, key: String, pos: u64) {
+        match self.inner.entry(key) {
+            Entry::Occupied(mut e) => {
+                let (_, rev) = *e.get();
+                e.insert((Some(pos), rev + 1));
+                self.stats.update(true);
+            }
+            Entry::Vacant(e) => {
+                e.insert((Some(pos), 0));
+                self.stats.update(false);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some((pos, rev)) = self.inner.get_mut(key) {
+            *pos = None;
+            *rev += 1;
+            self.stats.update(true);
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<u64> {
+        self.inner.get(key).and_then(|(pos, _)| *pos)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn should_compact(&self) -> bool {
+        self.stats.should_compact()
     }
 }
