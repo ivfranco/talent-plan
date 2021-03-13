@@ -7,7 +7,8 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     fmt::Debug,
     fs::{File, OpenOptions},
-    io::{BufWriter, Seek, SeekFrom, Write},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
+    mem,
     path::PathBuf,
 };
 use thiserror::Error;
@@ -35,6 +36,10 @@ pub enum Error {
     /// on-disk store file is corrupted / out of sync with the in-memory indices.
     #[error("Store file is corrupted around {0}")]
     StoreFileCorrupted(u64),
+
+    /// index points to a non-set command.
+    #[error("Command at {0} is not Set")]
+    NoValueAt(u64),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,10 +130,7 @@ impl KvStore {
             return Ok(None);
         };
 
-        match self.read_from(value_pos)? {
-            Command::Set(_, value) => Ok(Some(value)),
-            _ => Err(Error::StoreFileCorrupted(value_pos)),
-        }
+        self.read_value_from(value_pos).map(Some)
     }
 
     /// Removes a key from the store.
@@ -208,24 +210,14 @@ impl KvStore {
         append(&mut self.handle, command)
     }
 
-    fn read_from(&mut self, pos: u64) -> Result<Command> {
-        self.handle.seek(SeekFrom::Start(pos))?;
-        let mut file = self.handle.get_mut();
-        // The non-streaming deserializer will check if the character after the
-        // value is EOF or whitespace and throw an error otherwise, there's no
-        // way to match against a specific ErrorCode from serde_json (it's
-        // private), as a result serde_json::StreamDeserializer which skips this
-        // check is the only way to read a JSON value from the middle of an input
-        // stream
-        let mut de = serde_json::Deserializer::from_reader(&mut file).into_iter::<Command>();
-
-        let command = match de.next().transpose()? {
-            Some(command) => command,
-            _ => return Err(Error::StoreFileCorrupted(pos)),
+    fn read_value_from(&mut self, pos: u64) -> Result<String> {
+        self.handle.flush()?;
+        let value = match read_from(self.handle.get_ref(), pos)? {
+            Command::Set(_, value) => value,
+            _ => return Err(Error::NoValueAt(pos)),
         };
-
-        file.seek(SeekFrom::End(0))?;
-        Ok(command)
+        self.handle.seek(SeekFrom::End(0))?;
+        Ok(value)
     }
 
     /// The compaction test always succeeds on x86_64-pc-windows-msvc, the first
@@ -240,6 +232,28 @@ impl KvStore {
     }
 
     fn compact(&mut self) -> Result<()> {
+        self.handle.flush()?;
+
+        if !self.indices()?.should_compact() {
+            return Ok(());
+        }
+        let indices = mem::take(self.indices()?);
+
+        let dir = self.dir.clone();
+        let mut backup = BufWriter::new(File::create(dir.join(BACKUP_NAME))?);
+
+        for (key, pos) in indices.into_iter() {
+            let value = self.read_value_from(pos)?;
+            append(&mut backup, &Command::Set(key, value))?;
+        }
+        backup.flush()?;
+
+        // otherwise renaming 1.kvs to 0.kvs will trigger a permission error
+        self.handle = backup;
+
+        std::fs::rename(dir.join(BACKUP_NAME), dir.join(STORE_NAME))?;
+        *self = Self::open(dir)?;
+
         Ok(())
     }
 }
@@ -321,5 +335,27 @@ impl Indices {
 
     fn should_compact(&self) -> bool {
         self.stats.should_compact()
+    }
+
+    fn into_iter(self) -> impl Iterator<Item = (String, u64)> {
+        self.inner
+            .into_iter()
+            .filter_map(|(key, (pos, _))| pos.map(|pos| (key, pos)))
+    }
+}
+
+fn read_from<R: Read + Seek>(mut reader: R, pos: u64) -> Result<Command> {
+    // The non-streaming deserializer will check if the character after the
+    // value is EOF or whitespace and throw an error otherwise, there's no
+    // way to match against a specific ErrorCode from serde_json (it's
+    // private), as a result serde_json::StreamDeserializer which skips this
+    // check is the only way to read a JSON value from the middle of an input
+    // stream
+    reader.seek(SeekFrom::Start(pos))?;
+    let mut de = serde_json::Deserializer::from_reader(reader).into_iter::<Command>();
+
+    match de.next().transpose()? {
+        Some(command) => Ok(command),
+        _ => Err(Error::StoreFileCorrupted(pos)),
     }
 }
