@@ -32,13 +32,9 @@ pub enum Error {
     #[error("Open path is not a directory: {0}")]
     NotDirectory(PathBuf),
 
-    /// A value index points to a remove command.
-    #[error("Index {0} does not point to a command")]
-    InvalidPointer(u64),
-
-    /// Deserialized command does not contain a value.
-    #[error("Deserialized command does not contain a value")]
-    NonValueCommand,
+    /// on-disk store file is corrupted / out of sync with the in-memory indices.
+    #[error("Store file is corrupted around {0}")]
+    StoreFileCorrupted(u64),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -66,7 +62,7 @@ impl KvStore {
     ///
     /// ```
     /// # use kvs::KvStore;
-    /// let mut store = KvStore::open(".");
+    /// let mut store = KvStore::open(std::env::temp_dir());
     /// ```
     pub fn open<P: Into<PathBuf>>(path: P) -> Result<Self> {
         let mut path: PathBuf = path.into();
@@ -95,7 +91,7 @@ impl KvStore {
     /// ```
     /// # use kvs::{Result, KvStore};
     /// # fn main() -> Result<()> {
-    /// let mut store = KvStore::open(".")?;
+    /// let mut store = KvStore::open(std::env::temp_dir())?;
     /// store.set("key".to_string(), "value".to_string())?;
     /// # Ok(())
     /// # }
@@ -113,7 +109,7 @@ impl KvStore {
     /// ```rust
     /// # use kvs::{Result, KvStore};
     /// # fn main() -> Result<()> {
-    /// let mut store = KvStore::open(".")?;
+    /// let mut store = KvStore::open(std::env::temp_dir())?;
     /// store.set("key".to_string(), "value".to_string())?;
     /// assert_eq!(store.get("key".to_string())?, Some("value".to_string()));
     /// # Ok(())
@@ -128,7 +124,7 @@ impl KvStore {
 
         match self.read_from(value_pos)? {
             Command::Set(_, value) => Ok(Some(value)),
-            _ => Err(Error::NonValueCommand),
+            _ => Err(Error::StoreFileCorrupted(value_pos)),
         }
     }
 
@@ -138,7 +134,7 @@ impl KvStore {
     /// ```rust
     /// # use kvs::{Result, KvStore};
     /// # fn main() -> Result<()> {
-    /// let mut store = KvStore::open(".")?;
+    /// let mut store = KvStore::open(std::env::temp_dir())?;
     /// store.set("key".to_string(), "value".to_string())?;
     /// store.remove("key".to_string())?;
     /// assert_eq!(store.get("key".to_string())?, None);
@@ -216,13 +212,13 @@ impl KvStore {
         // value is EOF or whitespace and throw an error otherwise, there's no
         // way to match against a specific ErrorCode from serde_json (it's
         // private), as a result serde_json::StreamDeserializer which skips this
-        // check is the only way to read a JSON value from middle of an input
-        // stream.
+        // check is the only way to read a JSON value from the middle of an input
+        // stream
         let mut de = serde_json::Deserializer::from_reader(&mut file).into_iter::<Command>();
 
         let command = match de.next().transpose()? {
             Some(command) => command,
-            _ => return Err(Error::InvalidPointer(pos)),
+            _ => return Err(Error::StoreFileCorrupted(pos)),
         };
 
         file.seek(SeekFrom::End(0))?;
@@ -235,6 +231,12 @@ impl KvStore {
     pub fn on_disk_size(&mut self) -> Result<u64> {
         let file = self.handle.get_mut();
         let start = file.seek(SeekFrom::Start(0))?;
-        Ok(file.seek(SeekFrom::End(0))? - start)
+        file.seek(SeekFrom::End(0))
+            .map(|end| end - start)
+            .map_err(From::from)
+    }
+
+    fn compact(&mut self) -> Result<()> {
+        unimplemented!()
     }
 }

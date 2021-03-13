@@ -62,6 +62,15 @@ fn run_command(sub: &str, args: &mut Arguments) -> Result<()> {
     Ok(())
 }
 
+fn error_exit<T: Display>(err: T) -> ! {
+    print!("{}", err);
+    eprintln!(
+        "Try '{} --help' for more information.",
+        env!("CARGO_PKG_NAME")
+    );
+    process::exit(1)
+}
+
 fn no_more_args(args: &mut Arguments) {
     if free_arg(args).is_some() {
         error_exit("extra arguments");
@@ -78,15 +87,6 @@ fn free_arg(args: &mut Arguments) -> Option<String> {
 
 fn free_arg_or<T: Display>(args: &mut Arguments, err: T) -> String {
     free_arg(args).unwrap_or_else(|| error_exit(err))
-}
-
-fn error_exit<T: Display>(err: T) -> ! {
-    print!("{}", err);
-    eprintln!(
-        "Try '{} --help' for more information.",
-        env!("CARGO_PKG_NAME")
-    );
-    process::exit(1)
 }
 
 fn version() {

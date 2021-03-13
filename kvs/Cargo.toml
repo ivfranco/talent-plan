@@ -18,7 +18,6 @@ doctest = false
 assert_cmd = "1.0.3"
 predicates = "1.0.7"
 tempfile = "3.2.0"
-walkdir = "2.3.1"
 
 [dependencies]
 pico-args = "0.4.0"
