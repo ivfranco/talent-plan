@@ -33,11 +33,11 @@ pub enum Error {
     #[error("Open path is not a directory: {0}")]
     NotDirectory(PathBuf),
 
-    /// on-disk store file is corrupted / out of sync with the in-memory indices.
+    /// On-disk store file is corrupted / out of sync with the in-memory indices.
     #[error("Store file is corrupted around {0}")]
     StoreFileCorrupted(u64),
 
-    /// index points to a non-set command.
+    /// Index pointed to a non-set command.
     #[error("Command at {0} is not Set")]
     NoValueAt(u64),
 }
@@ -80,7 +80,7 @@ impl KvStore {
         let mut file = OpenOptions::new()
             .read(true)
             .create(true)
-            .write(true)
+            .append(true)
             .open(&path)?;
 
         file.seek(SeekFrom::End(0))?;
@@ -248,7 +248,7 @@ impl KvStore {
         }
         backup.flush()?;
 
-        // otherwise renaming 1.kvs to 0.kvs will trigger a permission error
+        // otherwise renaming 1.kvs to 0.kvs will cause permission error
         self.handle = backup;
 
         std::fs::rename(dir.join(BACKUP_NAME), dir.join(STORE_NAME))?;
@@ -265,15 +265,13 @@ fn append<W: Write>(writer: W, command: &Command) -> Result<()> {
 
 #[derive(Clone, Copy, Default)]
 struct Stats {
+    // The number of logs on disk.
     logs: u32,
+    // The number of values on disk.
     values: u32,
 }
 
 impl Stats {
-    fn new() -> Self {
-        Self::default()
-    }
-
     fn update(&mut self, is_overwrite: bool) {
         if !is_overwrite {
             self.values += 1;
@@ -294,6 +292,7 @@ type Revision = u32;
 
 #[derive(Default)]
 struct Indices {
+    // TODO: make use of revisions.
     inner: HashMap<String, (Option<u64>, Revision)>,
     stats: Stats,
 }
@@ -345,13 +344,13 @@ impl Indices {
 }
 
 fn read_from<R: Read + Seek>(mut reader: R, pos: u64) -> Result<Command> {
+    reader.seek(SeekFrom::Start(pos))?;
     // The non-streaming deserializer will check if the character after the
     // value is EOF or whitespace and throw an error otherwise, there's no
     // way to match against a specific ErrorCode from serde_json (it's
     // private), as a result serde_json::StreamDeserializer which skips this
     // check is the only way to read a JSON value from the middle of an input
-    // stream
-    reader.seek(SeekFrom::Start(pos))?;
+    // stream.
     let mut de = serde_json::Deserializer::from_reader(reader).into_iter::<Command>();
 
     match de.next().transpose()? {
