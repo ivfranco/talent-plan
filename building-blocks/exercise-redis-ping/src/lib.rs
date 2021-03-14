@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod parser;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -16,17 +17,44 @@ pub enum Error {
 
     #[error("Integer overflow")]
     Overflow,
+
+    #[error("Serde error: {0}")]
+    Serde(String),
+
+    #[error("CR/LF in simple string")]
+    SimpleCRLF,
+
+    #[error("Simple string is not encoded as utf8")]
+    NonUtf8,
+}
+
+impl serde::ser::Error for Error {
+    fn custom<T>(msg: T) -> Self
+    where
+        T: std::fmt::Display,
+    {
+        Self::Serde(msg.to_string())
+    }
+}
+
+impl serde::de::Error for Error {
+    fn custom<T>(msg: T) -> Self
+    where
+        T: std::fmt::Display,
+    {
+        Self::Serde(msg.to_string())
+    }
 }
 
 type Result<T> = std::result::Result<T, Error>;
 
-use std::net::{Ipv4Addr, ToSocketAddrs};
+use std::net::{TcpListener, TcpStream};
 use std::{
-    io::Write,
-    net::{TcpListener, TcpStream},
+    net::{Ipv4Addr, ToSocketAddrs},
+    str::from_utf8,
 };
 
-use parser::{Parser, Value};
+use parser::{Parser, Serializer, Value};
 
 struct PingClient {
     conn: TcpStream,
@@ -39,27 +67,20 @@ impl PingClient {
     }
 
     fn ping_and_check(&self, msg: Option<&[u8]>) -> Result<()> {
-        let mut conn = &self.conn;
-        let len = if msg.is_some() { 2 } else { 1 };
+        let conn = &self.conn;
 
-        // start of array
-        write!(conn, "*{}\r\n", len)?;
-        // bulk string "PING"
-        write!(conn, "${}\r\nPING", b"PING".len())?;
+        let mut cmd = vec![Value::BulkString(b"PING".to_vec())];
         if let Some(msg) = msg {
-            // bulk string msg
-            write!(conn, "${}\r\n", msg.len())?;
-            conn.write_all(msg)?;
+            cmd.push(Value::BulkString(msg.to_vec()));
         }
-        // end of array
-        conn.write_all(b"\r\n")?;
-        conn.flush()?;
 
-        let str = Parser::new(conn).simple_string()?;
+        Value::Array(cmd).serialize(&mut Serializer::from_writer(conn))?;
+
+        let str = String::deserialize(&mut Parser::new(conn))?;
         let correct = if let Some(msg) = msg {
-            str == msg
+            str.as_bytes() == msg
         } else {
-            &str == b"PONG"
+            &str == "PONG"
         };
 
         if correct {
@@ -82,9 +103,7 @@ impl PongServer {
     }
 
     fn handle(mut stream: TcpStream) -> Result<()> {
-        let cmd = Parser::new(&mut stream)
-            .array()?
-            .ok_or_else(|| Error::SyntaxError("Null array command".to_string()))?;
+        let cmd = Vec::<Value>::deserialize(&mut Parser::new(&mut stream))?;
 
         let ping = cmd
             .get(0)
@@ -94,13 +113,17 @@ impl PongServer {
             return Err(Error::Unsupported);
         }
 
-        stream.write_all(b"+")?;
-        if let Some(Value::BulkString(msg)) = cmd.get(1) {
-            stream.write_all(msg)?;
+        let response = if let Some(Value::BulkString(msg)) = cmd.get(1) {
+            Value::SimpleString(
+                from_utf8(msg)
+                    .map(|s| s.to_string())
+                    .map_err(|_| Error::NonUtf8)?,
+            )
         } else {
-            stream.write_all(b"PONG")?;
-        }
-        stream.write_all(b"\r\n")?;
+            Value::SimpleString("PONG".to_string())
+        };
+
+        response.serialize(&mut Serializer::from_writer(stream))?;
 
         Ok(())
     }
