@@ -4,9 +4,14 @@ use kvs::{
     cmd::*,
     server::{Flavor, KvsServer},
 };
+use log::info;
 use pico_args::Arguments;
 
 fn main() {
+    env_logger::init();
+
+    info!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
+
     let args = Arguments::from_env();
     if let Err(err) = cmd(args) {
         error_exit(err, env!("CARGO_BIN_NAME"));

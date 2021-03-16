@@ -17,6 +17,8 @@ my implementation of project-2).
 `anyhow::Error::context` is useful when the error happened deep down the call stack, but
 the same information can be more naturally captured by a logger IMHO.
 
+# Building blocks 3
+
 ### Exercise: Serialize and deserialize 1000 data structures with serde (BSON)
 
 BSON is the only one which cannot directly serialize a T: Serialize to a Writer.
@@ -45,3 +47,10 @@ A few point still applies such as:
 > disk cache. To reach independence, we discard the first VM invocation for
 > each benchmark from our measurements and only retain the subsequent
 > measurements,
+
+# project 3
+
+`sled` by default caches all writes and only flushes to disk every 1000ms. At
+least on x86_64-pc-windows-msvc, `std::process::Child::kill` will skip Drop
+implementations, when used as a KvsEngine the sled::Db must be flushed after
+every modifying operation otherwise a few tests won't pass.

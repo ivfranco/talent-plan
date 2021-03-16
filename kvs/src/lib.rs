@@ -18,7 +18,7 @@ pub(crate) mod sled_engine;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::Entry, HashMap},
-    fmt::Debug,
+    fmt::{Debug, Display},
     fs::{File, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     mem,
@@ -75,13 +75,21 @@ pub enum Corruption {
     HasNoValue,
 }
 
-// used in storage and net protocol
-#[derive(Serialize, Deserialize)]
-pub(crate) enum Command {
+/// Command used both in on-disk store and network protocol.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Command {
+    /// Set the value of a string key to a string value.
     Set(String, String),
-    // net protocol only
+    /// *network protocol only* Get the string value of a given string key.
     Get(String),
+    /// Remove a given key.
     Remove(String),
+}
+
+impl Display for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as Debug>::fmt(self, f)
+    }
 }
 
 /// Alias for a `Result` with the error type `kvs::Error`.

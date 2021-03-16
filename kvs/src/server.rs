@@ -4,7 +4,8 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    io::{Error as IOError, Write},
+    fmt::{Debug, Display},
+    io::{Error as IOError, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::Path,
     str::FromStr,
@@ -33,7 +34,19 @@ pub enum Error {
 
     /// Error in the server-client protocol.
     #[error("{0}")]
-    Protocol(#[from] serde_json::Error),
+    ProtocolParse(#[from] serde_json::Error),
+
+    /// Unexpected response to a command.
+    #[error("Unexpected response {1} to command {0}")]
+    UnexpectedResponse(Command, Response),
+
+    /// Server side error.
+    #[error("{0}")]
+    ServerError(String),
+
+    /// Unexpected EOF.
+    #[error("Unexpected EOF")]
+    UnexpectedEOF,
 }
 
 impl Error {
@@ -66,11 +79,21 @@ impl FromStr for Flavor {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub(crate) enum Response {
+/// Server response to client comments.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Response {
+    /// Response to Set and Remove.
     Ok,
+    /// Response to Get.
     Value(Option<String>),
+    /// Error Responses.
     Err(String),
+}
+
+impl Display for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as Debug>::fmt(self, f)
+    }
 }
 
 /// A persistent key-value store server.
@@ -98,6 +121,8 @@ impl KvsServer {
 
     /// Start accepting and serving incoming requests from clients on the address.
     pub fn listen(&mut self, addr: SocketAddr) -> Result<(), Error> {
+        info!("Listening at {}...", addr);
+
         for stream in TcpListener::bind(addr)?.incoming() {
             let stream = match stream {
                 Ok(stream) => stream,
@@ -107,11 +132,13 @@ impl KvsServer {
                 }
             };
 
+            info!("Accepted connection from {:?}", stream.peer_addr());
+
             if let Err(err) = self.serve(&stream) {
                 error!("On serving client via TCP: {}", err);
                 // the stream is likely unusable on a net error
                 if !matches!(err, Error::Net(..)) {
-                    let _ = serde_json::to_writer(&stream, &Response::Err(err.to_string()));
+                    let _ = write_response(&stream, &Response::Err(err.to_string()));
                 }
                 // server should not halt on any error that's non-fatal
                 if err.should_halt() {
@@ -123,23 +150,28 @@ impl KvsServer {
         Ok(())
     }
 
-    fn serve(&mut self, mut stream: &TcpStream) -> Result<(), Error> {
-        match serde_json::from_reader(stream)? {
+    fn serve(&mut self, stream: &TcpStream) -> Result<(), Error> {
+        let command = stream_deserialize(stream)?;
+
+        info!("Received client command: {}", command);
+
+        let response = match command {
             Command::Get(key) => {
                 let value = self.engine.get(key)?;
-                serde_json::to_writer(stream, &Response::Value(value)).map_err(IOError::from)?;
+                Response::Value(value)
             }
             Command::Set(key, value) => {
                 self.engine.set(key, value)?;
-                serde_json::to_writer(stream, &Response::Ok).map_err(IOError::from)?;
+                Response::Ok
             }
             Command::Remove(key) => {
                 self.engine.remove(key)?;
-                serde_json::to_writer(stream, &Response::Ok).map_err(IOError::from)?;
+                Response::Ok
             }
-        }
+        };
 
-        stream.flush()?;
+        write_response(stream, &response)?;
+        info!("Sent response: {}", response);
         Ok(())
     }
 }
@@ -153,4 +185,23 @@ fn persisting_flavor<P: AsRef<Path>>(path: P) -> Option<Flavor> {
     } else {
         None
     }
+}
+
+fn stream_deserialize<'de, R, D>(reader: R) -> Result<D, Error>
+where
+    R: Read,
+    D: Deserialize<'de>,
+{
+    let mut de = serde_json::Deserializer::from_reader(reader).into_iter::<D>();
+
+    match de.next().transpose()? {
+        Some(d) => Ok(d),
+        None => Err(Error::UnexpectedEOF),
+    }
+}
+
+fn write_response(mut stream: &TcpStream, response: &Response) -> Result<(), Error> {
+    serde_json::to_writer(stream, response).map_err(IOError::from)?;
+    stream.flush()?;
+    Ok(())
 }

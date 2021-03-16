@@ -12,11 +12,13 @@ impl SledKvsEngine {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SledError> {
         let path = path.as_ref();
         let db = sled::open(path.join(SLED_STORE_DIR))?;
+        info!("Sled db was recovered: {}", db.was_recovered());
         Ok(Self { db })
     }
 
     pub fn set(&mut self, key: String, value: String) -> Result<(), SledError> {
         self.db.insert(key, value.as_str())?;
+        self.db.flush()?;
         Ok(())
     }
 
@@ -30,9 +32,10 @@ impl SledKvsEngine {
         }
     }
 
-    pub fn remove(&self, key: String) -> Result<(), SledError> {
-        self.db.remove(key)?;
-        Ok(())
+    pub fn remove(&self, key: String) -> Result<bool, SledError> {
+        let value = self.db.remove(key)?;
+        self.db.flush()?;
+        Ok(value.is_some())
     }
 }
 
@@ -46,7 +49,11 @@ impl KvsEngine for SledKvsEngine {
     }
 
     fn remove(&mut self, key: String) -> Result<(), KvError> {
-        SledKvsEngine::remove(self, key).map_err(From::from)
+        if SledKvsEngine::remove(self, key)? {
+            Ok(())
+        } else {
+            Err(KvError::KeyNotFound)
+        }
     }
 }
 
