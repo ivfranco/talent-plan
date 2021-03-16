@@ -2,6 +2,19 @@
 
 #![deny(missing_docs)]
 
+#[macro_use]
+extern crate log;
+
+/// Error handling functionalities for command line applications.
+pub mod cmd;
+/// A persistent key-value store server.
+pub mod server;
+
+/// A persistent key-value store client.
+pub mod client;
+
+pub(crate) mod sled_engine;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -21,7 +34,7 @@ pub enum Error {
     #[error("File system error: {0}")]
     FS(#[from] std::io::Error),
 
-    /// JSON [de]serialization errors.
+    /// Json [de]serialization errors.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
@@ -34,17 +47,40 @@ pub enum Error {
     NotDirectory(PathBuf),
 
     /// On-disk store file is corrupted / out of sync with the in-memory indices.
-    #[error("Store file is corrupted around {0}")]
-    StoreFileCorrupted(u64),
+    #[error("Store file is corrupted around {0}, {1:?}")]
+    StoreFileCorrupted(u64, Corruption),
 
-    /// Index pointed to a non-set command.
-    #[error("Command at {0} is not Set")]
-    NoValueAt(u64),
+    /// Sled errors.
+    #[error("Sled Error: {0}")]
+    Sled(#[from] sled::Error),
 }
 
+impl Error {
+    // the remove command returns Result<()>, hence KeyNotFound must be an error
+    // code, but unlike other errors it's not fatal and should not halt the
+    // program.
+    fn should_halt(&self) -> bool {
+        !matches!(self, Error::KeyNotFound)
+    }
+}
+
+/// Possible kinds of store corruption.
+#[derive(Debug)]
+pub enum Corruption {
+    /// Bytes cannot be deserialized to a command.
+    DeserializeFailure,
+    /// Get command found in on-disk store.
+    GetCommandInStorage,
+    /// Deserialized command does not contain a value.
+    HasNoValue,
+}
+
+// used in storage and net protocol
 #[derive(Serialize, Deserialize)]
-enum Command {
+pub(crate) enum Command {
     Set(String, String),
+    // net protocol only
+    Get(String),
     Remove(String),
 }
 
@@ -59,7 +95,8 @@ pub struct KvStore {
     dir: PathBuf,
 }
 
-const STORE_NAME: &str = "0.kvs";
+/// The on-disk file name of the store.
+pub(crate) const STORE_NAME: &str = "0.kvs";
 const BACKUP_NAME: &str = "1.kvs";
 
 impl KvStore {
@@ -193,6 +230,12 @@ impl KvStore {
                 Some(Command::Remove(key)) => {
                     indices.remove(&key);
                 }
+                Some(Command::Get(..)) => {
+                    return Err(Error::StoreFileCorrupted(
+                        pos,
+                        Corruption::GetCommandInStorage,
+                    ));
+                }
                 None => {
                     break;
                 }
@@ -212,9 +255,9 @@ impl KvStore {
 
     fn read_value_from(&mut self, pos: u64) -> Result<String> {
         self.handle.flush()?;
-        let value = match read_from(self.handle.get_ref(), pos)? {
+        let value = match seek_read_from(self.handle.get_ref(), pos)? {
             Command::Set(_, value) => value,
-            _ => return Err(Error::NoValueAt(pos)),
+            _ => return Err(Error::StoreFileCorrupted(pos, Corruption::HasNoValue)),
         };
         self.handle.seek(SeekFrom::End(0))?;
         Ok(value)
@@ -259,7 +302,7 @@ impl KvStore {
 }
 
 fn append<W: Write>(writer: W, command: &Command) -> Result<()> {
-    serde_json::to_writer(writer, command)?;
+    serde_json::to_writer(writer, command).map_err(|e| Error::FS(e.into()))?;
     Ok(())
 }
 
@@ -343,7 +386,7 @@ impl Indices {
     }
 }
 
-fn read_from<R: Read + Seek>(mut reader: R, pos: u64) -> Result<Command> {
+fn seek_read_from<R: Read + Seek>(mut reader: R, pos: u64) -> Result<Command> {
     reader.seek(SeekFrom::Start(pos))?;
     // The non-streaming deserializer will check if the character after the
     // value is EOF or whitespace and throw an error otherwise, there's no
@@ -355,6 +398,35 @@ fn read_from<R: Read + Seek>(mut reader: R, pos: u64) -> Result<Command> {
 
     match de.next().transpose()? {
         Some(command) => Ok(command),
-        _ => Err(Error::StoreFileCorrupted(pos)),
+        _ => Err(Error::StoreFileCorrupted(
+            pos,
+            Corruption::DeserializeFailure,
+        )),
+    }
+}
+
+/// A key-value store that supports Set, Get and Remove operations.
+pub trait KvsEngine {
+    /// Set or overwite a string key to a string value in the key-value store.
+    fn set(&mut self, key: String, value: String) -> Result<()>;
+    /// Get the value corresponding to a string key in the key-value store,
+    /// return None if the key doesn't exist.
+    fn get(&mut self, key: String) -> Result<Option<String>>;
+    /// Delete a string key and the corresponding value from the key-value
+    /// store. Return an error when the key doesn't exist.
+    fn remove(&mut self, key: String) -> Result<()>;
+}
+
+impl KvsEngine for KvStore {
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        self.set(key, value)
+    }
+
+    fn get(&mut self, key: String) -> Result<Option<String>> {
+        self.get(key)
+    }
+
+    fn remove(&mut self, key: String) -> Result<()> {
+        self.remove(key)
     }
 }

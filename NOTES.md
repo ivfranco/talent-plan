@@ -21,3 +21,27 @@ the same information can be more naturally captured by a logger IMHO.
 
 BSON is the only one which cannot directly serialize a T: Serialize to a Writer.
 Is that inherent or is it a design choice?
+
+### Exercise: Write a Redis ping-pong client and server with serialized messages
+
+It's much more verbose than I thought, end up cutting all the possible
+corners as RESPv2 doesn't support struct. Encountered a recursive type bound
+which rustc cannot resolve (similar to [this stackoverflow question](https://stackoverflow.com/questions/53405287/whats-going-on-with-this-bizarre-recursive-type-error-in-rust)
+but with BufRead).
+
+### Reading: Statistically Rigorous Java Performance Evaluation
+
+In contrast to Java, Rust doesn't have:
+
+- JIT compilation
+- VM variation / warming up
+- GC
+
+A few point still applies such as:
+
+> the first VM invocation in a series of measurements may change system
+> state that persists past this first VM invocation, such as dynamically
+> loaded libraries persisting in physical memory or data persisting in the
+> disk cache. To reach independence, we discard the first VM invocation for
+> each benchmark from our measurements and only retain the subsequent
+> measurements,

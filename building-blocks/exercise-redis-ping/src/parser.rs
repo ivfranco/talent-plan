@@ -1,10 +1,14 @@
 use super::{Error, Result};
+use serde::ser::SerializeSeq;
 use serde::{
     de::{SeqAccess, Visitor},
-    ser::{Impossible, SerializeSeq, SerializeTuple},
+    ser::{
+        Impossible, SerializeStruct, SerializeTuple, SerializeTupleStruct, SerializeTupleVariant,
+    },
     Deserializer,
 };
 use std::{
+    convert::TryInto,
     io::{BufRead, BufReader, ErrorKind, Read, Write},
     str::from_utf8,
 };
@@ -87,6 +91,13 @@ impl<'de> Visitor<'de> for ValueVisitor {
 
         Ok(Value::Array(vec))
     }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Value::Null)
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for Value {
@@ -114,10 +125,10 @@ impl<W: Write> serde::Serializer for &mut Serializer<W> {
     type Error = Error;
     type SerializeSeq = Self;
     type SerializeTuple = Self;
-    type SerializeTupleStruct = Impossible<(), Error>;
-    type SerializeTupleVariant = Impossible<(), Error>;
+    type SerializeTupleStruct = Self;
+    type SerializeTupleVariant = Self;
     type SerializeMap = Impossible<(), Error>;
-    type SerializeStruct = Impossible<(), Error>;
+    type SerializeStruct = Self;
     type SerializeStructVariant = Impossible<(), Error>;
 
     fn serialize_bool(self, v: bool) -> Result<Self::Ok> {
@@ -212,9 +223,9 @@ impl<W: Write> serde::Serializer for &mut Serializer<W> {
         self,
         _name: &'static str,
         _variant_index: u32,
-        _variant: &'static str,
+        variant: &'static str,
     ) -> Result<Self::Ok> {
-        self.serialize_unit()
+        self.serialize_str(variant)
     }
 
     fn serialize_newtype_struct<T: ?Sized>(self, _name: &'static str, value: &T) -> Result<Self::Ok>
@@ -228,13 +239,14 @@ impl<W: Write> serde::Serializer for &mut Serializer<W> {
         self,
         _name: &'static str,
         _variant_index: u32,
-        _variant: &'static str,
-        _value: &T,
+        variant: &'static str,
+        value: &T,
     ) -> Result<Self::Ok>
     where
         T: serde::Serialize,
     {
-        Err(Error::Unsupported)
+        self.serialize_str(variant)?;
+        value.serialize(self)
     }
 
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
@@ -247,33 +259,39 @@ impl<W: Write> serde::Serializer for &mut Serializer<W> {
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple> {
+        // RESP doesn't distinguish between tuple and homogeneous sequence
         self.serialize_seq(Some(len))
     }
 
     fn serialize_tuple_struct(
         self,
         _name: &'static str,
-        _len: usize,
+        len: usize,
     ) -> Result<Self::SerializeTupleStruct> {
-        Err(Error::Unsupported)
+        self.serialize_tuple(len)
     }
 
     fn serialize_tuple_variant(
         self,
         _name: &'static str,
         _variant_index: u32,
-        _variant: &'static str,
+        variant: &'static str,
         _len: usize,
     ) -> Result<Self::SerializeTupleVariant> {
-        Err(Error::Unsupported)
+        // a singleton Map type backported from RESPv3
+        write!(&mut self.writer, "%1\r\n")?;
+        self.serialize_str(variant)?;
+        Ok(self)
     }
 
     fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap> {
         Err(Error::Unsupported)
     }
 
-    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct> {
-        Err(Error::Unsupported)
+    fn serialize_struct(self, _name: &'static str, len: usize) -> Result<Self::SerializeStruct> {
+        // backported from RESPv3
+        write!(&mut self.writer, "%{}\r\n", len)?;
+        Ok(self)
     }
 
     fn serialize_struct_variant(
@@ -319,6 +337,57 @@ impl<W: Write> SerializeTuple for &mut Serializer<W> {
     }
 }
 
+impl<W: Write> SerializeTupleStruct for &mut Serializer<W> {
+    type Ok = ();
+    type Error = Error;
+
+    fn serialize_field<T: ?Sized>(&mut self, value: &T) -> Result<()>
+    where
+        T: serde::Serialize,
+    {
+        value.serialize(&mut **self)
+    }
+
+    fn end(self) -> Result<Self::Ok> {
+        Ok(())
+    }
+}
+
+impl<W: Write> SerializeTupleVariant for &mut Serializer<W> {
+    type Ok = ();
+    type Error = Error;
+
+    fn serialize_field<T: ?Sized>(&mut self, value: &T) -> Result<()>
+    where
+        T: serde::Serialize,
+    {
+        value.serialize(&mut **self)
+    }
+
+    fn end(self) -> Result<Self::Ok> {
+        Ok(())
+    }
+}
+
+impl<W: Write> SerializeStruct for &mut Serializer<W> {
+    type Ok = ();
+    type Error = Error;
+
+    fn serialize_field<T: ?Sized>(&mut self, key: &'static str, value: &T) -> Result<()>
+    where
+        T: serde::Serialize,
+    {
+        use serde::Serializer;
+
+        (**self).serialize_str(key)?;
+        value.serialize(&mut **self)
+    }
+
+    fn end(self) -> Result<Self::Ok> {
+        Ok(())
+    }
+}
+
 #[allow(unused_variables)]
 impl<'de, R: BufRead> serde::Deserializer<'de> for &mut Parser<R> {
     type Error = Error;
@@ -340,84 +409,106 @@ impl<'de, R: BufRead> serde::Deserializer<'de> for &mut Parser<R> {
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        match self.integer()? {
+            0 => visitor.visit_bool(false),
+            1 => visitor.visit_bool(true),
+            _ => Err(Error::Overflow),
+        }
     }
 
     fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        let int = self.integer()?.try_into().map_err(|_| Error::Overflow)?;
+        visitor.visit_i8(int)
     }
 
     fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        let int = self.integer()?.try_into().map_err(|_| Error::Overflow)?;
+        visitor.visit_i16(int)
     }
 
     fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        let int = self.integer()?.try_into().map_err(|_| Error::Overflow)?;
+        visitor.visit_i32(int)
     }
 
     fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        visitor.visit_i64(self.integer()?)
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        let int = self.integer()?.try_into().map_err(|_| Error::Overflow)?;
+        visitor.visit_u8(int)
     }
 
     fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        let int = self.integer()?.try_into().map_err(|_| Error::Overflow)?;
+        visitor.visit_u16(int)
     }
 
     fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        let int = self.integer()?.try_into().map_err(|_| Error::Overflow)?;
+        visitor.visit_u32(int)
     }
 
     fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        let int = self.integer()?.try_into().map_err(|_| Error::Overflow)?;
+        visitor.visit_u64(int)
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        Err(Error::Unsupported)
     }
 
     fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        Err(Error::Unsupported)
     }
 
     fn deserialize_char<V>(self, visitor: V) -> Result<V::Value>
     where
         V: serde::de::Visitor<'de>,
     {
-        todo!()
+        let str = self.simple_string()?;
+        let mut chars = str.chars();
+        let char = chars
+            .next()
+            .ok_or_else(|| Error::Serde("Expected char, found empty string".to_string()))?;
+        if chars.next().is_none() {
+            visitor.visit_char(char)
+        } else {
+            Err(Error::Serde(
+                "Expacted char, found multi-char string".to_string(),
+            ))
+        }
     }
 
     fn deserialize_str<V>(self, visitor: V) -> Result<V::Value>
@@ -579,6 +670,17 @@ impl<'a, 'de, R: BufRead> SeqAccess<'de> for Counted<'a, R> {
             Ok(None)
         } else {
             self.count -= 1;
+
+            // this triggers recursive type bound E0275
+            // seed.deserialize(&mut Parser::from_buffered(&mut self.parser.reader))
+            //     .map(Some)
+
+            // this triggers compile error "cannot move out value behind a
+            // mutable reference"
+            // seed.deserialize(self.parser).map(Some)
+
+            // this is fine, &mut * creates a new mutable reference to Parser
+            // lexically overlapping &mut self but legal according to NLL
             seed.deserialize(&mut *self.parser).map(Some)
         }
     }
@@ -655,8 +757,8 @@ impl<R: BufRead> Parser<R> {
         let digits = self.take_while(u8::is_ascii_digit)?;
         digits
             .into_iter()
-            .fold(Some(0i64), |int, b| {
-                let int = int?.checked_mul(10)?;
+            .try_fold(0i64, |int, b| {
+                let int = int.checked_mul(10)?;
                 int.checked_add(i64::from(b - b'0'))
             })
             .ok_or(Error::Overflow)
@@ -676,24 +778,6 @@ impl<R: BufRead> Parser<R> {
             int.checked_neg().ok_or(Error::Overflow)
         } else {
             Ok(int)
-        }
-    }
-
-    fn parse(&mut self) -> Result<Value> {
-        match self.peek()? {
-            b'+' => self.simple_string().map(Value::SimpleString),
-            b':' => self.integer().map(Value::Integer),
-            b'$' => match self.bulk_string() {
-                Ok(Some(str)) => Ok(Value::BulkString(str)),
-                Ok(None) => Ok(Value::Null),
-                Err(e) => Err(e),
-            },
-            b'*' => match self.array() {
-                Ok(Some(arr)) => Ok(Value::Array(arr)),
-                Ok(None) => Ok(Value::Null),
-                Err(e) => Err(e),
-            },
-            _ => Err(Error::Unsupported),
         }
     }
 
@@ -727,27 +811,12 @@ impl<R: BufRead> Parser<R> {
             Ok(Some(str))
         }
     }
-
-    pub fn array(&mut self) -> Result<Option<Vec<Value>>> {
-        self.tag(b"*")?;
-        let len = self.signed()?;
-        self.crlf()?;
-        if len < 0 {
-            return Ok(None);
-        }
-
-        let mut arr = Vec::with_capacity(len as usize);
-        for _ in 0..len {
-            arr.push(self.parse()?);
-        }
-
-        Ok(Some(arr))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
 
     #[test]
     fn parse_integer() -> Result<()> {
@@ -780,21 +849,15 @@ mod tests {
     #[test]
     fn parse_array() -> Result<()> {
         let mut parser = Parser::new(b"*3\r\n:1\r\n:2\r\n:3\r\n".as_ref());
-        assert_eq!(
-            parser.array()?,
-            Some(vec![
-                Value::Integer(1),
-                Value::Integer(2),
-                Value::Integer(3)
-            ])
-        );
+        let vec = Vec::<i64>::deserialize(&mut parser)?;
+        assert_eq!(vec, &[1, 2, 3]);
         Ok(())
     }
 
     #[test]
     fn parse_null_array() -> Result<()> {
         let mut parser = Parser::new(b"*-1\r\n".as_ref());
-        assert_eq!(parser.array()?, None);
+        assert_eq!(Value::deserialize(&mut parser)?, Value::Null);
         Ok(())
     }
 }
