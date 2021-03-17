@@ -680,7 +680,8 @@ impl<'a, 'de, R: BufRead> SeqAccess<'de> for Counted<'a, R> {
             // seed.deserialize(self.parser).map(Some)
 
             // this is fine, &mut * creates a new mutable reference to Parser
-            // lexically overlapping &mut self but legal according to NLL
+            // lexically overlapping &mut self but legal according to the borrow
+            // checker
             seed.deserialize(&mut *self.parser).map(Some)
         }
     }

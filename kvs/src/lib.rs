@@ -13,7 +13,8 @@ pub mod server;
 /// A persistent key-value store client.
 pub mod client;
 
-pub(crate) mod sled_engine;
+/// An alternative persisten key-value store based on sled.
+pub mod sled_engine;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,7 +23,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     mem,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use thiserror::Error;
 
@@ -104,7 +105,7 @@ pub struct KvStore {
 }
 
 /// The on-disk file name of the store.
-pub(crate) const STORE_NAME: &str = "0.kvs";
+pub const STORE_NAME: &str = "0.kvs";
 const BACKUP_NAME: &str = "1.kvs";
 
 impl KvStore {
@@ -115,8 +116,8 @@ impl KvStore {
     /// # use kvs::KvStore;
     /// let mut store = KvStore::open(std::env::temp_dir());
     /// ```
-    pub fn open<P: Into<PathBuf>>(dir: P) -> Result<Self> {
-        let dir: PathBuf = dir.into();
+    pub fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
+        let dir: PathBuf = dir.as_ref().to_owned();
         if !dir.is_dir() {
             return Err(Error::NotDirectory(dir));
         }

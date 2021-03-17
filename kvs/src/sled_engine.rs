@@ -2,13 +2,16 @@ use crate::{Error as KvError, KvsEngine};
 use sled::{Db, Error as SledError};
 use std::{path::Path, str::from_utf8};
 
+/// A wrapper over sled::Db.
 pub struct SledKvsEngine {
     db: Db,
 }
 
+/// The on-disk directory of the sled store.
 pub const SLED_STORE_DIR: &str = ".sled";
 
 impl SledKvsEngine {
+    /// Creates a handle to the on-disk key-value store.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SledError> {
         let path = path.as_ref();
         let db = sled::open(path.join(SLED_STORE_DIR))?;
@@ -16,12 +19,21 @@ impl SledKvsEngine {
         Ok(Self { db })
     }
 
+    /// Insert a key-value pair into the store.
     pub fn set(&mut self, key: String, value: String) -> Result<(), SledError> {
         self.db.insert(key, value.as_str())?;
+        // `sled` by default caches all writes and only flushes to disk every
+        // 1000ms, a few tests spawns the server on a child process then calls
+        // `std::process::Child::kill` on to terminate it. At least on
+        // x86_64-pc-windows-msvc, `std::process::Child::kill` will skip `Drop`
+        // implementations, when used as a KvsEngine the `sled::Db` must be
+        // flushed after every modifying operation otherwise a few tests won't
+        // pass.
         self.db.flush()?;
         Ok(())
     }
 
+    /// Returns a owned String value corresponding to the key.
     pub fn get(&self, key: String) -> Result<Option<String>, SledError> {
         if let Some(value) = self.db.get(key)? {
             from_utf8(&value)
@@ -32,6 +44,7 @@ impl SledKvsEngine {
         }
     }
 
+    /// Removes a key from the store.
     pub fn remove(&self, key: String) -> Result<bool, SledError> {
         let value = self.db.remove(key)?;
         self.db.flush()?;

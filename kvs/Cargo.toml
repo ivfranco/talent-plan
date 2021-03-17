@@ -23,9 +23,15 @@ name = "kvs-client"
 test = false
 doctest = false
 
+[[bench]]
+name = "kvs_benchmark"
+harness = false
+
 [dev-dependencies]
 assert_cmd = "1.0.3"
+criterion = "0.3.4"
 predicates = "1.0.7"
+rand = { version = "^0.8", features = ["small_rng"] }
 tempfile = "3.2.0"
 
 [dependencies]
