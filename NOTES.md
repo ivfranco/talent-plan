@@ -78,3 +78,5 @@ after every modifying operation otherwise a few tests won't pass.
 > In today's Rust, concurrency is entirely a library affair ... And that's
 > very exciting, because it means that Rust's concurrency story can endlessly
 > evolve, growing to encompass new paradigms and catch new classes of bugs.
+
+Then we had `Future`.

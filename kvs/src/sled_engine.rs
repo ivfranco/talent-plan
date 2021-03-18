@@ -3,6 +3,7 @@ use sled::{Db, Error as SledError};
 use std::{path::Path, str::from_utf8};
 
 /// A wrapper over sled::Db.
+#[derive(Clone)]
 pub struct SledKvsEngine {
     db: Db,
 }
@@ -20,7 +21,7 @@ impl SledKvsEngine {
     }
 
     /// Insert a key-value pair into the store.
-    pub fn set(&mut self, key: String, value: String) -> Result<(), SledError> {
+    pub fn set(&self, key: String, value: String) -> Result<(), SledError> {
         self.db.insert(key, value.as_str())?;
         // `sled` by default caches all writes and only flushes to disk every
         // 1000ms, a few tests spawns the server on a child process then calls
@@ -53,15 +54,15 @@ impl SledKvsEngine {
 }
 
 impl KvsEngine for SledKvsEngine {
-    fn set(&mut self, key: String, value: String) -> Result<(), KvError> {
+    fn set(&self, key: String, value: String) -> Result<(), KvError> {
         self.set(key, value).map_err(From::from)
     }
 
-    fn get(&mut self, key: String) -> Result<Option<String>, KvError> {
+    fn get(&self, key: String) -> Result<Option<String>, KvError> {
         SledKvsEngine::get(self, key).map_err(From::from)
     }
 
-    fn remove(&mut self, key: String) -> Result<(), KvError> {
+    fn remove(&self, key: String) -> Result<(), KvError> {
         if SledKvsEngine::remove(self, key)? {
             Ok(())
         } else {
@@ -77,13 +78,13 @@ mod tests {
 
     #[test]
     fn sled_set() -> Result<(), SledError> {
-        let mut store = SledKvsEngine::open(tempdir()?)?;
+        let store = SledKvsEngine::open(tempdir()?)?;
         store.set("Key".to_string(), "Value".to_string())
     }
 
     #[test]
     fn sled_get() -> Result<(), SledError> {
-        let mut store = SledKvsEngine::open(tempdir()?)?;
+        let store = SledKvsEngine::open(tempdir()?)?;
         store.set("Key".to_string(), "Value".to_string())?;
         assert_eq!(store.get("Key".to_string())?, Some("Value".to_string()));
         Ok(())
@@ -91,7 +92,7 @@ mod tests {
 
     #[test]
     fn sled_remove() -> Result<(), SledError> {
-        let mut store = SledKvsEngine::open(tempdir()?)?;
+        let store = SledKvsEngine::open(tempdir()?)?;
         store.set("Key".to_string(), "Value".to_string())?;
         assert_eq!(store.get("Key".to_string())?, Some("Value".to_string()));
         store.remove("Key".to_string())?;

@@ -16,6 +16,9 @@ pub mod client;
 /// An alternative persisten key-value store based on sled.
 pub mod sled_engine;
 
+/// Thread pool used to execute jobs in parallel on a fixed number of threads.
+pub mod thread_pool;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -24,12 +27,14 @@ use std::{
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     mem,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError},
 };
 use thiserror::Error;
 
 /// This type represents all possible errors that can occur when accessing the
-/// KvStore. Wraps std::io::Error and serde_json error.
-#[derive(Error, Debug)]
+/// key-value store engines. Wraps std::io::Error serde_json error and
+/// sled::Error.
+#[derive(Error)]
 pub enum Error {
     /// IO errors thrown by the file system underneath.
     #[error("File system error: {0}")]
@@ -54,6 +59,20 @@ pub enum Error {
     /// Sled errors.
     #[error("Sled Error: {0}")]
     Sled(#[from] sled::Error),
+
+    /// Failed to spawn the given number of threads on construction.
+    #[error("Failed to spawn threads on construction")]
+    FailedToSpawn,
+
+    /// Other general unrecoverable errors.
+    #[error("{0}")]
+    Other(Box<dyn Display>),
+}
+
+impl Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as Display>::fmt(self, f)
+    }
 }
 
 impl Error {
@@ -65,13 +84,25 @@ impl Error {
     }
 }
 
+impl<T> From<PoisonError<T>> for Error {
+    fn from(_err: PoisonError<T>) -> Self {
+        Error::Other(Box::new("Lock poisoned"))
+    }
+}
+
+impl From<rayon_core::ThreadPoolBuildError> for Error {
+    fn from(err: rayon_core::ThreadPoolBuildError) -> Self {
+        Error::Other(Box::new(err))
+    }
+}
+
 /// Possible kinds of store corruption.
 #[derive(Debug)]
 pub enum Corruption {
     /// Bytes cannot be deserialized to a command.
     DeserializeFailure,
     /// Get command found in on-disk store.
-    GetCommandInStorage,
+    UnexpectedCommandInStorage,
     /// Deserialized command does not contain a value.
     HasNoValue,
 }
@@ -81,10 +112,10 @@ pub enum Corruption {
 pub enum Command {
     /// Set the value of a string key to a string value.
     Set(String, String),
-    /// *network protocol only* Get the string value of a given string key.
-    Get(String),
     /// Remove a given key.
     Remove(String),
+    /// *network protocol only* Get the string value of a given string key.
+    Get(String),
 }
 
 impl Display for Command {
@@ -239,10 +270,10 @@ impl KvStore {
                 Some(Command::Remove(key)) => {
                     indices.remove(&key);
                 }
-                Some(Command::Get(..)) => {
+                Some(..) => {
                     return Err(Error::StoreFileCorrupted(
                         pos,
-                        Corruption::GetCommandInStorage,
+                        Corruption::UnexpectedCommandInStorage,
                     ));
                 }
                 None => {
@@ -415,27 +446,55 @@ fn seek_read_from<R: Read + Seek>(mut reader: R, pos: u64) -> Result<Command> {
 }
 
 /// A key-value store that supports Set, Get and Remove operations.
-pub trait KvsEngine {
+pub trait KvsEngine: Clone + Send + 'static {
     /// Set or overwite a string key to a string value in the key-value store.
-    fn set(&mut self, key: String, value: String) -> Result<()>;
+    fn set(&self, key: String, value: String) -> Result<()>;
     /// Get the value corresponding to a string key in the key-value store,
     /// return None if the key doesn't exist.
-    fn get(&mut self, key: String) -> Result<Option<String>>;
+    fn get(&self, key: String) -> Result<Option<String>>;
     /// Delete a string key and the corresponding value from the key-value
     /// store. Return an error when the key doesn't exist.
-    fn remove(&mut self, key: String) -> Result<()>;
+    fn remove(&self, key: String) -> Result<()>;
 }
 
-impl KvsEngine for KvStore {
-    fn set(&mut self, key: String, value: String) -> Result<()> {
-        self.set(key, value)
+/// Sharable [KvStore](KvStore).
+pub struct LogKvsEngine {
+    store: Arc<Mutex<KvStore>>,
+}
+
+impl LogKvsEngine {
+    /// Creates a handle to the on-disk key-value store.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let store = KvStore::open(path)?;
+        Ok(Self {
+            store: Arc::new(Mutex::new(store)),
+        })
     }
 
-    fn get(&mut self, key: String) -> Result<Option<String>> {
-        self.get(key)
+    /// Exposed for tests.
+    pub fn on_disk_size(&self) -> Result<u64> {
+        self.store.lock()?.on_disk_size()
+    }
+}
+
+impl Clone for LogKvsEngine {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+        }
+    }
+}
+
+impl KvsEngine for LogKvsEngine {
+    fn set(&self, key: String, value: String) -> Result<()> {
+        self.store.lock()?.set(key, value)
     }
 
-    fn remove(&mut self, key: String) -> Result<()> {
-        self.remove(key)
+    fn get(&self, key: String) -> Result<Option<String>> {
+        self.store.lock()?.get(key)
+    }
+
+    fn remove(&self, key: String) -> Result<()> {
+        self.store.lock()?.remove(key)
     }
 }

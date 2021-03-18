@@ -1,6 +1,6 @@
 use crate::{
-    sled_engine::{SledKvsEngine, SLED_STORE_DIR},
-    Command, Error as KvsError, KvStore, KvsEngine, STORE_NAME,
+    sled_engine::SLED_STORE_DIR, thread_pool::ThreadPool, Command, Error as KvsError, KvsEngine,
+    STORE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -97,82 +97,45 @@ impl Display for Response {
 }
 
 /// A persistent key-value store server.
-pub struct KvsServer {
-    engine: Box<dyn KvsEngine>,
+pub struct KvsServer<E: KvsEngine, P: ThreadPool> {
+    engine: E,
+    pool: P,
 }
 
-impl KvsServer {
-    /// Start the server with the engine flavor.
-    pub fn open(flavor: Option<Flavor>) -> Result<Self, Error> {
-        let cwd = std::env::current_dir()?;
-
-        let flavor = match (flavor, persisting_flavor(&cwd)) {
-            (Some(f), Some(p)) if f != p => return Err(Error::EngineMismatch),
-            (arg, persistent) => arg.or(persistent).unwrap_or(Flavor::Kvs),
-        };
-
-        let engine: Box<dyn KvsEngine> = match flavor {
-            Flavor::Kvs => Box::new(KvStore::open(&cwd)?),
-            Flavor::Sled => Box::new(SledKvsEngine::open(&cwd).map_err(KvsError::Sled)?),
-        };
-
-        Ok(Self { engine })
+impl<E: KvsEngine, P: ThreadPool> KvsServer<E, P> {
+    /// Start the server with the provided key-value store engine and thread pool.
+    pub fn open(engine: E, pool: P) -> Self {
+        Self { engine, pool }
     }
 
     /// Start accepting and serving incoming requests from clients on the address.
-    pub fn listen(&mut self, addr: SocketAddr) -> Result<(), Error> {
+    pub fn listen(&self, addr: Option<SocketAddr>) -> Result<(), Error> {
+        let addr = addr.unwrap_or_else(default_addr);
         info!("Listening at {}...", addr);
 
-        for stream in TcpListener::bind(addr)?.incoming() {
+        let listener = TcpListener::bind(addr)?;
+
+        for stream in listener.incoming() {
             let stream = match stream {
-                Ok(stream) => stream,
+                Ok(stream) => {
+                    info!("Accepted connection from {:?}", stream.peer_addr());
+                    stream
+                }
                 Err(err) => {
                     error!("On accepting TCP connection: {}", err);
                     continue;
                 }
             };
 
-            info!("Accepted connection from {:?}", stream.peer_addr());
-
-            if let Err(err) = self.serve(&stream) {
-                error!("On serving client via TCP: {}", err);
-                // the stream is likely unusable on a net error
-                if !matches!(err, Error::Net(..)) {
-                    let _ = write_response(&stream, &Response::Err(err.to_string()));
-                }
-                // server should not halt on any error that's non-fatal
-                if err.should_halt() {
-                    return Err(err);
-                }
-            }
+            self.serve(stream);
         }
 
         Ok(())
     }
 
-    fn serve(&mut self, stream: &TcpStream) -> Result<(), Error> {
-        let command = stream_deserialize(stream)?;
-
-        info!("Received client command: {}", command);
-
-        let response = match command {
-            Command::Get(key) => {
-                let value = self.engine.get(key)?;
-                Response::Value(value)
-            }
-            Command::Set(key, value) => {
-                self.engine.set(key, value)?;
-                Response::Ok
-            }
-            Command::Remove(key) => {
-                self.engine.remove(key)?;
-                Response::Ok
-            }
-        };
-
-        write_response(stream, &response)?;
-        info!("Sent response: {}", response);
-        Ok(())
+    fn serve(&self, stream: TcpStream) {
+        let engine = self.engine.clone();
+        self.pool.spawn(move || serve(engine, stream));
     }
 }
 
@@ -184,6 +147,21 @@ fn persisting_flavor<P: AsRef<Path>>(path: P) -> Option<Flavor> {
         Some(Flavor::Sled)
     } else {
         None
+    }
+}
+
+/// Choose the correct given the command-line argument and the flavor of engine
+/// persisting on the disk.
+/// # Errors
+///
+/// When an engine flavor different to the flavor persisting on the disk is
+/// specified, throws an [Error::EngineMismatch](Error::EngineMismatch).
+pub fn choose_flavor(arg_flavor: Option<Flavor>) -> Result<Flavor, Error> {
+    let cwd = std::env::current_dir().map_err(crate::Error::FS)?;
+
+    match (arg_flavor, persisting_flavor(&cwd)) {
+        (Some(a), Some(p)) if a != p => Err(Error::EngineMismatch),
+        (arg, persistent) => Ok(arg.or(persistent).unwrap_or(Flavor::Kvs)),
     }
 }
 
@@ -204,4 +182,52 @@ fn write_response(mut stream: &TcpStream, response: &Response) -> Result<(), Err
     serde_json::to_writer(stream, response).map_err(IOError::from)?;
     stream.flush()?;
     Ok(())
+}
+
+fn try_serve<E: KvsEngine>(engine: E, stream: &TcpStream) -> Result<(), Error> {
+    let command = stream_deserialize(stream)?;
+
+    info!(
+        "Received command from {:?}: {}",
+        stream.peer_addr(),
+        command
+    );
+
+    let response = match command {
+        Command::Get(key) => {
+            let value = engine.get(key)?;
+            Response::Value(value)
+        }
+        Command::Set(key, value) => {
+            engine.set(key, value)?;
+            Response::Ok
+        }
+        Command::Remove(key) => {
+            engine.remove(key)?;
+            Response::Ok
+        }
+    };
+
+    write_response(stream, &response)?;
+    info!("Sent response to {:?}: {}", stream.peer_addr(), response);
+    Ok(())
+}
+
+fn handle_errors(err: Error, stream: &TcpStream) {
+    error!("On serving client via TCP: {}", err);
+    // the stream is likely unusable on a net error
+    if !matches!(err, Error::Net(..)) {
+        let _ = write_response(stream, &Response::Err(err.to_string()));
+    }
+}
+
+fn serve<E: KvsEngine>(engine: E, stream: TcpStream) {
+    if let Err(e) = try_serve(engine, &stream) {
+        handle_errors(e, &stream);
+    }
+}
+
+/// Default listening address of the [KvsServer](KvsServer).
+pub fn default_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 4000))
 }

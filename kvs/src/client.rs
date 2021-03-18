@@ -1,6 +1,6 @@
 use std::{
     io::Write,
-    net::{SocketAddr, TcpStream},
+    net::{TcpStream, ToSocketAddrs},
 };
 
 use crate::{
@@ -15,7 +15,7 @@ pub struct KvsClient {
 
 impl KvsClient {
     /// Connect to a server at the given address.
-    pub fn connect(addr: SocketAddr) -> Result<Self, Error> {
+    pub fn connect<S: ToSocketAddrs>(addr: S) -> Result<Self, Error> {
         let conn = TcpStream::connect(addr)?;
         Ok(Self { conn })
     }
