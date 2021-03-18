@@ -19,6 +19,10 @@ pub mod sled_engine;
 /// Thread pool used to execute jobs in parallel on a fixed number of threads.
 pub mod thread_pool;
 
+/// A TcpListener that can be remotely shutdown without resorting to SIGTERM or
+/// SIGKILL.
+pub mod listener;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::Entry, HashMap},

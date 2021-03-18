@@ -14,7 +14,7 @@ use thiserror::Error;
 
 /// This type represents all possible errors that can occur when operating the
 /// key-value store server and client.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum Error {
     /// Unknown engine flavor.
     #[error("Unknown engine flavor")]
@@ -50,11 +50,18 @@ pub enum Error {
 }
 
 impl Error {
+    #[allow(dead_code)]
     fn should_halt(&self) -> bool {
         match self {
             Error::Kvs(e) => e.should_halt(),
             _ => false,
         }
+    }
+}
+
+impl Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as Display>::fmt(self, f)
     }
 }
 
@@ -129,6 +136,11 @@ impl<E: KvsEngine, P: ThreadPool> KvsServer<E, P> {
 
             self.serve(stream);
         }
+
+        // A plan of programmatical shutdown:
+        // Shutdown switch (oneshot channel)==>
+        // Listener wrapper (tokio select on channel and TcpListener) ==>
+        // Server order (Shutdown or TcpStream)
 
         Ok(())
     }
