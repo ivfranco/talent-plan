@@ -126,7 +126,7 @@ where
     /// Spawn the server on another thread, return the remote shutdown switch.
     pub fn spawn(self, addr: Option<SocketAddr>) -> ShutdownSwitch {
         let addr = addr.unwrap_or_else(default_addr);
-        info!("Listening at {}...", addr);
+        info!("Initializing at {}...", addr);
 
         let (order_tx, order_rx) = channel();
         let switch = Listener::spawn(addr, order_tx);
@@ -173,11 +173,6 @@ where
 
             self.serve(stream);
         }
-
-        // A plan of programmatical shutdown:
-        // Shutdown switch (oneshot channel)==>
-        // Listener wrapper (tokio select on channel and TcpListener) ==>
-        // Server order (Shutdown or TcpStream)
 
         Ok(())
     }

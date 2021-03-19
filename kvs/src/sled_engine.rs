@@ -23,13 +23,11 @@ impl SledKvsEngine {
     /// Insert a key-value pair into the store.
     pub fn set(&self, key: String, value: String) -> Result<(), SledError> {
         self.db.insert(key, value.as_str())?;
-        // `sled` by default caches all writes and only flushes to disk every
-        // 1000ms, a few tests spawns the server on a child process then calls
-        // `std::process::Child::kill` on to terminate it. At least on
-        // x86_64-pc-windows-msvc, `std::process::Child::kill` will skip `Drop`
-        // implementations, when used as a KvsEngine the `sled::Db` must be
-        // flushed after every modifying operation otherwise a few tests won't
-        // pass.
+        // `sled` by default caches all writes and only flushes to disk every 1000ms, a few tests
+        // spawns the server on a child process then calls `std::process::Child::kill` on to
+        // terminate it. At least on x86_64-pc-windows-msvc, `std::process::Child::kill` will skip
+        // `Drop` implementations, when used as a KvsEngine the `sled::Db` must be flushed after
+        // every modifying operation otherwise a few tests won't pass.
         self.db.flush()?;
         Ok(())
     }

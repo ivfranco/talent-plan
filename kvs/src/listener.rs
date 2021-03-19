@@ -38,7 +38,7 @@ impl ShutdownSwitch {
         }
     }
 
-    /// Block the current thread until the listener thread is terminated.
+    /// Block the current thread until the listener thread is terminated by other means.
     pub fn block(self) {
         let _ = self.join_handle.join();
     }
@@ -77,6 +77,8 @@ impl Listener {
         order_tx: Sender<ServerOrder>,
         shutdown_rx: oneshot::Receiver<()>,
     ) -> io::Result<()> {
+        // this function may not be a future, nontheless it's a runtime error to call it not inside
+        // of a tokio runtime.
         let listener = TcpListener::bind(addr).await?;
 
         let this = Self {
@@ -110,6 +112,7 @@ impl Listener {
                 Either::Right((item, _)) => match item {
                     Ok((s, _)) => {
                         let stream = s.into_std()?;
+                        // by default tokio set TcpStream's to non-blocking mode
                         stream.set_nonblocking(false)?;
                         if order_tx.send(ServerOrder::Stream(stream)).is_err() {
                             warn!("Order receiver dropped, terminate listener");

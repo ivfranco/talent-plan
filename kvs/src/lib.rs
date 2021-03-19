@@ -26,17 +26,16 @@ pub mod listener;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{hash_map::Entry, HashMap},
     fmt::{Debug, Display},
     fs::{File, OpenOptions},
-    io::{BufWriter, Read, Seek, SeekFrom, Write},
-    mem,
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc, PoisonError, RwLock,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard,
     },
 };
+use tempfile::tempfile;
 use thiserror::Error;
 
 /// This type represents all possible errors that can occur when accessing the
@@ -84,16 +83,15 @@ impl Debug for Error {
 }
 
 impl Error {
-    // the remove command returns Result<()>, hence KeyNotFound must be an error
-    // code, but unlike other errors it's not fatal and should not halt the
-    // program.
+    // the remove command returns Result<()>, hence KeyNotFound must be an error code, but unlike
+    // other errors it's not fatal and should not halt the program.
     fn should_halt(&self) -> bool {
         !matches!(self, Error::KeyNotFound)
     }
 }
 
 impl<T> From<PoisonError<T>> for Error {
-    fn from(_err: PoisonError<T>) -> Self {
+    fn from(_: PoisonError<T>) -> Self {
         Error::Other(Box::new("Lock poisoned"))
     }
 }
@@ -138,8 +136,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A persistent log-structured key-value store of pairs of Strings. Currently
 /// commands are serialized to JSON for readability.
 pub struct KvStore {
-    writer: BufWriter<File>,
-    indices: Indices,
+    stats: Stats,
+    reader: RwLock<File>,
+    writer: Mutex<PBufWriter<File>>,
+    indices: DashMap<String, Span>,
     dir: PathBuf,
 }
 
@@ -157,152 +157,279 @@ impl KvStore {
     /// ```
     pub fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
         let dir: PathBuf = dir.as_ref().to_owned();
+        info!("Initiating KvStore under directory {:?}", dir);
+
         if !dir.is_dir() {
             return Err(Error::NotDirectory(dir));
         }
-        let path = dir.join(STORE_NAME);
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .create(true)
-            .append(true)
-            .open(&path)?;
-
-        file.seek(SeekFrom::Start(0))?;
-        let indices = build_indices(&mut file)?;
-        file.seek(SeekFrom::End(0))?;
+        let (writer, mut reader) = open_file(&dir)?;
+        let stats = Stats::default();
+        let indices = build_indices(&mut reader, &stats)?;
 
         Ok(Self {
-            writer: BufWriter::new(file),
+            stats,
+            reader: RwLock::new(reader),
+            writer: Mutex::new(writer),
             indices,
             dir,
         })
     }
 
-    /// Insert a key-value pair into the store.
-    /// # Examples
-    ///
-    /// ```
-    /// # use kvs::{Result, KvStore};
-    /// # fn main() -> Result<()> {
-    /// let mut store = KvStore::open(std::env::temp_dir())?;
-    /// store.set("key".to_string(), "value".to_string())?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        let pos = self.pos()?;
-        self.append(&Command::Set(key.clone(), value))?;
-        self.indices.insert(key, pos);
-        self.compact()?;
-        Ok(())
-    }
-
-    /// Returns a owned String value corresponding to the key.
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use kvs::{Result, KvStore};
-    /// # fn main() -> Result<()> {
-    /// let mut store = KvStore::open(std::env::temp_dir())?;
-    /// store.set("key".to_string(), "value".to_string())?;
-    /// assert_eq!(store.get("key".to_string())?, Some("value".to_string()));
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        let value_pos = if let Some(pos) = self.indices.get(&key) {
-            pos
-        } else {
-            return Ok(None);
-        };
-
-        self.read_value_from(value_pos).map(Some)
-    }
-
-    /// Removes a key from the store.
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use kvs::{Result, KvStore};
-    /// # fn main() -> Result<()> {
-    /// let mut store = KvStore::open(std::env::temp_dir())?;
-    /// store.set("key".to_string(), "value".to_string())?;
-    /// store.remove("key".to_string())?;
-    /// assert_eq!(store.get("key".to_string())?, None);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn remove(&mut self, key: String) -> Result<()> {
-        if !self.indices.contains_key(&key) {
-            Err(Error::KeyNotFound)
-        } else {
-            self.append(&Command::Remove(key.clone()))?;
-            self.indices.remove(&key);
-            self.compact()?;
-            Ok(())
+    fn to_reader(&self) -> Result<KvsReader> {
+        if self.stats.buf_len() > 0 {
+            // buffered data must be first flushed to the disk
+            self.to_writer()?.flush()?;
         }
-    }
 
-    fn pos(&mut self) -> Result<u64> {
-        self.writer
-            // skip the flush
-            .get_mut()
-            // this seek is safe because the write position is not actually
-            // changed
-            .seek(SeekFrom::Current(0))
-            .map_err(From::from)
-    }
-
-    // Calls to KvStore::set and KvStore::remove, when the indice is in place,
-    // should not force the BufWriter to be flushed (mainly by seek), as a
-    // consequence other public methods must seek to the end of the file on
-    // exit.
-    fn append(&mut self, command: &Command) -> Result<()> {
-        append(&mut self.writer, command)
-    }
-
-    fn read_value_from(&mut self, pos: u64) -> Result<String> {
-        self.writer.flush()?;
-        let value = match seek_read_from(self.writer.get_ref(), pos)? {
-            Command::Set(_, value) => value,
-            _ => return Err(Error::StoreFileCorrupted(pos, Corruption::HasNoValue)),
+        let reader = KvsReader {
+            reader: self.reader.read()?,
+            indices: &self.indices,
         };
-        self.writer.seek(SeekFrom::End(0))?;
-        Ok(value)
+
+        Ok(reader)
     }
 
-    /// The compaction test always succeeds on x86_64-pc-windows-msvc, the first
-    /// step towards a functioning compaction strategy is to make the test fail
-    /// when it should.
+    fn to_writer(&self) -> Result<KvsWriter> {
+        Ok(KvsWriter {
+            stats: &self.stats,
+            writer: self.writer.lock()?,
+            indices: &self.indices,
+        })
+    }
+
+    /// The compaction test always succeeds on x86_64-pc-windows-msvc, the first step towards a
+    /// functioning compaction strategy is to make the test fail when it should.
     pub fn logs(&self) -> u32 {
-        self.indices.logs()
+        self.stats.logs()
     }
 
-    fn compact(&mut self) -> Result<()> {
-        self.writer.flush()?;
+    fn should_compact(&self) -> bool {
+        self.stats.should_compact()
+    }
 
-        if !self.indices.should_compact() {
-            return Ok(());
-        }
-        let indices = mem::take(&mut self.indices);
+    fn compact(&self) -> Result<()> {
+        info!("Compaction triggered");
 
-        let dir = self.dir.clone();
-        let mut backup = BufWriter::new(File::create(dir.join(BACKUP_NAME))?);
+        self.to_writer()?.flush()?;
 
-        for (key, pos) in indices.iter() {
-            let value = self.read_value_from(pos)?;
+        // lock both reader and writer, compact must have exclusive control over the store
+        let mut reader = self.reader.write()?;
+        let mut writer = self.writer.lock()?;
+
+        // clear the indices, all values in it will be invalid after compaction
+        let indices = self.indices.clone();
+        self.indices.clear();
+
+        // write only non-overwritten Get commands to the new file
+        let mut backup = BufWriter::new(File::create(self.dir.join(BACKUP_NAME))?);
+        for (key, span) in indices {
+            let value = read_value_from(&reader, span)?;
             append(&mut backup, &Command::Set(key, value))?;
         }
         backup.flush()?;
 
-        // otherwise renaming 1.kvs to 0.kvs will cause permission error
-        self.writer = backup;
+        // drop the old file descriptors, otherwise renaming stores will cause permission error.
+        let temp = tempfile()?;
+        *reader = temp.try_clone()?;
+        *writer = PBufWriter::new(temp, 0);
 
-        std::fs::rename(dir.join(BACKUP_NAME), dir.join(STORE_NAME))?;
-        *self = Self::open(dir)?;
+        std::fs::rename(self.dir.join(BACKUP_NAME), self.dir.join(STORE_NAME))?;
+
+        // rebuild reader and writer
+        let (write_fs, read_fs) = open_file(&self.dir)?;
+        *reader = read_fs;
+        *writer = write_fs;
+
+        // rebuild indices and stats
+        self.stats.clear();
+        let entries = build_indices(&mut *reader, &self.stats)?;
+        for (key, value) in entries {
+            self.indices.insert(key, value);
+        }
+
+        // sanity check
+        assert!(self.stats.utilization() - 1.0 < 1e-10);
+        assert_eq!(self.indices.len(), self.logs() as usize);
 
         Ok(())
+    }
+}
+
+fn open_file(dir: &Path) -> Result<(PBufWriter<File>, File)> {
+    let path = dir.join(STORE_NAME);
+
+    let mut write_fd = OpenOptions::new().create(true).append(true).open(&path)?;
+    let end = write_fd.seek(SeekFrom::End(0))?;
+
+    let read_fd = File::open(path)?;
+
+    Ok((PBufWriter::new(write_fd, end), read_fd))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    pos: u64,
+    len: u64,
+}
+
+fn read_span(file: &File, span: Span) -> Result<Command> {
+    info!("Reading span: {:?}", span);
+
+    let Span { pos, len } = span;
+    let mut buf = vec![0u8; len as usize];
+    read_exact_at(file, &mut buf, pos)?;
+
+    match serde_json::from_reader(buf.as_slice())? {
+        Some(command) => Ok(command),
+        _ => Err(Error::StoreFileCorrupted(
+            pos,
+            Corruption::DeserializeFailure,
+        )),
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn read_exact_at(file: &File, buf: &mut [u8], pos: u64) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    fn read_at(file: &File, buf: &mut [u8], pos: u64) -> io::Result<usize> {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buf, pos)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_at(file: &File, buf: &mut [u8], pos: u64) -> io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, pos)
+    }
+
+    let mut amt = 0;
+    while amt < buf.len() {
+        // dbg!(amt);
+        amt += read_at(file, &mut buf[amt..], pos + amt as u64)?;
+    }
+    Ok(())
+}
+
+struct KvsReader<'a> {
+    indices: &'a Indices,
+    reader: RwLockReadGuard<'a, File>,
+}
+
+impl<'a> KvsReader<'a> {
+    /// Returns a owned String value corresponding to the key.
+    pub fn get(&self, key: String) -> Result<Option<String>> {
+        let span = if let Some(entry) = self.indices.get(&key) {
+            *entry.value()
+        } else {
+            return Ok(None);
+        };
+
+        read_value_from(&self.reader, span).map(Some)
+    }
+}
+
+fn read_value_from(file: &File, span: Span) -> Result<String> {
+    let value = match read_span(file, span)? {
+        Command::Set(_, value) => value,
+        _ => return Err(Error::StoreFileCorrupted(span.pos, Corruption::HasNoValue)),
+    };
+
+    Ok(value)
+}
+
+struct KvsWriter<'a> {
+    stats: &'a Stats,
+    writer: MutexGuard<'a, PBufWriter<File>>,
+    indices: &'a Indices,
+}
+
+impl<'a> KvsWriter<'a> {
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        let span = self.append(&Command::Set(key.clone(), value))?;
+
+        let is_overwrite = self.indices.insert(key, span).is_some();
+        self.update_stats(is_overwrite);
+
+        Ok(())
+    }
+
+    fn remove(&mut self, key: String) -> Result<()> {
+        if !self.indices.contains_key(&key) {
+            Err(Error::KeyNotFound)
+        } else {
+            self.indices.remove(&key);
+            self.append(&Command::Remove(key))?;
+
+            self.update_stats(true);
+
+            Ok(())
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        self.set_buf_len();
+        assert_eq!(self.stats.buf_len(), 0);
+        Ok(())
+    }
+
+    fn append(&mut self, command: &Command) -> Result<Span> {
+        let pos = self.writer.pos();
+        append(&mut *self.writer, command)?;
+        let len = self.writer.pos() - pos;
+        Ok(Span { pos, len })
+    }
+
+    fn update_stats(&self, is_overwite: bool) {
+        self.stats.update(is_overwite);
+        self.set_buf_len();
+    }
+
+    fn set_buf_len(&self) {
+        self.stats.set_buf_len(self.writer.buf_len());
+    }
+}
+
+impl<'a> Drop for KvsWriter<'a> {
+    fn drop(&mut self) {
+        // The same problem as the sled engine, `Child::kill` will skip `Drop` implements on
+        // KvsStore, hence `flush` must be called here.
+        let _ = self.flush();
+    }
+}
+
+struct PBufWriter<W: Write> {
+    inner: BufWriter<W>,
+    pos: u64,
+}
+
+impl<W: Write> PBufWriter<W> {
+    fn new(writer: W, pos: u64) -> Self {
+        Self {
+            inner: BufWriter::new(writer),
+            pos,
+        }
+    }
+
+    fn pos(&self) -> u64 {
+        self.pos
+    }
+
+    fn buf_len(&self) -> usize {
+        self.inner.buffer().len()
+    }
+}
+
+impl<W: Write> Write for PBufWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.pos += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -317,99 +444,66 @@ struct Stats {
     logs: AtomicU32,
     // The number of values on disk.
     values: AtomicU32,
+    // bytes in the write buffer.
+    buf_len: AtomicUsize,
 }
 
 impl Stats {
     fn update(&self, is_overwrite: bool) {
         if !is_overwrite {
-            self.values.fetch_add(1, Ordering::Release);
+            self.values.fetch_add(1, Ordering::AcqRel);
         }
-        self.logs.fetch_add(1, Ordering::Release);
+        self.logs.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn utilization(&self) -> f64 {
-        self.values.load(Ordering::Acquire) as f64 / self.logs.load(Ordering::Acquire) as f64
-    }
-
-    fn should_compact(&self) -> bool {
-        self.utilization() < 0.25 && self.logs.load(Ordering::Acquire) >= 100_000
-    }
-}
-
-/// Indices into the on-disk store file.
-#[derive(Default)]
-struct Indices {
-    inner: DashMap<String, u64>,
-    stats: Stats,
-}
-
-impl Indices {
-    fn new() -> Self {
-        Self::default()
+    fn clear(&self) {
+        self.logs.store(0, Ordering::SeqCst);
+        self.values.store(0, Ordering::SeqCst);
+        self.buf_len.store(0, Ordering::SeqCst);
     }
 
     fn logs(&self) -> u32 {
-        self.stats.logs.load(Ordering::Acquire)
+        self.logs.load(Ordering::Acquire)
     }
 
-    fn insert(&self, key: String, pos: u64) {
-        let is_overwrite = self.inner.insert(key, pos).is_some();
-        self.stats.update(is_overwrite);
+    fn values(&self) -> u32 {
+        self.values.load(Ordering::Acquire)
     }
 
-    fn remove(&self, key: &str) {
-        let is_overwrite = self.inner.remove(key).is_some();
-        self.stats.update(is_overwrite);
-    }
-
-    fn get(&self, key: &str) -> Option<u64> {
-        self.inner.get(key).map(|entry| *entry.value())
-    }
-
-    fn contains_key(&self, key: &str) -> bool {
-        self.get(key).is_some()
+    fn utilization(&self) -> f64 {
+        self.values() as f64 / self.logs() as f64
     }
 
     fn should_compact(&self) -> bool {
-        self.stats.should_compact()
+        self.utilization() < 0.4 && self.logs() >= 100_000
     }
 
-    fn iter(&self) -> impl Iterator<Item = (String, u64)> + '_ {
-        self.inner
-            .iter()
-            .map(|entry| (entry.key().to_string(), *entry.value()))
+    fn set_buf_len(&self, buf_len: usize) {
+        self.buf_len.store(buf_len, Ordering::Release);
     }
-}
 
-fn seek_read_from<R: Read + Seek>(mut reader: R, pos: u64) -> Result<Command> {
-    reader.seek(SeekFrom::Start(pos))?;
-    // The non-streaming deserializer will check if the character after the value is EOF or
-    // whitespace and throw an error otherwise, there's no way to match against a specific ErrorCode
-    // from serde_json (it's private), as a result serde_json::StreamDeserializer which skips this
-    // check is the only way to read a JSON value from the middle of an input stream.
-    let mut de = serde_json::Deserializer::from_reader(reader).into_iter::<Command>();
-
-    match de.next().transpose()? {
-        Some(command) => Ok(command),
-        _ => Err(Error::StoreFileCorrupted(
-            pos,
-            Corruption::DeserializeFailure,
-        )),
+    fn buf_len(&self) -> usize {
+        self.buf_len.load(Ordering::Acquire)
     }
 }
 
-fn build_indices<R: Read>(reader: R) -> Result<Indices> {
-    let mut de = serde_json::Deserializer::from_reader(reader).into_iter();
-    let indices = Indices::new();
+type Indices = DashMap<String, Span>;
+
+fn build_indices<R: Read>(reader: R, stats: &Stats) -> Result<Indices> {
+    let mut de = serde_json::Deserializer::from_reader(BufReader::new(reader)).into_iter();
+    let indices = DashMap::new();
 
     loop {
         let pos = de.byte_offset() as u64;
         match de.next().transpose()? {
             Some(Command::Set(key, _)) => {
-                indices.insert(key, pos);
+                let len = de.byte_offset() as u64 - pos;
+                let is_overwrite = indices.insert(key, Span { pos, len }).is_some();
+                stats.update(is_overwrite);
             }
             Some(Command::Remove(key)) => {
                 indices.remove(&key);
+                stats.update(true);
             }
             Some(..) => {
                 return Err(Error::StoreFileCorrupted(
@@ -429,18 +523,56 @@ fn build_indices<R: Read>(reader: R) -> Result<Indices> {
 /// A key-value store that supports Set, Get and Remove operations.
 pub trait KvsEngine: Clone + Send + 'static {
     /// Set or overwite a string key to a string value in the key-value store.
+    /// #Example
+    ///
+    /// ```rust
+    /// # use kvs::{KvsEngine, LogKvsEngine, Result};
+    /// # fn main() -> Result<()> {
+    /// let engine = LogKvsEngine::open(tempfile::tempdir()?)?;
+    /// engine.set("key".to_string(), "value".to_string())?;
+    /// # Ok(())
+    /// # }
+    /// ```
     fn set(&self, key: String, value: String) -> Result<()>;
+
     /// Get the value corresponding to a string key in the key-value store, return None if the key
     /// doesn't exist.
+    /// #Example
+    ///
+    /// ```rust
+    /// # use kvs::{KvsEngine, LogKvsEngine, Result};
+    /// # fn main() -> Result<()> {
+    /// let engine = LogKvsEngine::open(tempfile::tempdir()?)?;
+    /// engine.set("key".to_string(), "value".to_string())?;
+    /// assert_eq!(engine.get("key".to_string())?, Some("value".to_string()));
+    /// assert_eq!(engine.get("none".to_string())?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
     fn get(&self, key: String) -> Result<Option<String>>;
+
     /// Delete a string key and the corresponding value from the key-value store. Return an error
     /// when the key doesn't exist.
+    /// #Example
+    ///
+    /// ```rust
+    /// # use kvs::{KvsEngine, LogKvsEngine, Result};
+    /// # fn main() -> Result<()> {
+    /// let engine = LogKvsEngine::open(tempfile::tempdir()?)?;
+    /// engine.set("key".to_string(), "value".to_string())?;
+    /// assert_eq!(engine.get("key".to_string())?, Some("value".to_string()));
+    /// engine.remove("key".to_string())?;
+    /// assert_eq!(engine.get("key".to_string())?, None);
+    /// assert!(engine.remove("key".to_string()).is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
     fn remove(&self, key: String) -> Result<()>;
 }
 
 /// Sharable [KvStore](KvStore).
 pub struct LogKvsEngine {
-    store: Arc<RwLock<KvStore>>,
+    store: Arc<KvStore>,
 }
 
 impl LogKvsEngine {
@@ -448,13 +580,13 @@ impl LogKvsEngine {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let store = KvStore::open(path)?;
         Ok(Self {
-            store: Arc::new(RwLock::new(store)),
+            store: Arc::new(store),
         })
     }
 
     /// Exposed for tests.
-    pub fn on_disk_size(&self) -> Result<u32> {
-        Ok(self.store.read()?.logs())
+    pub fn on_disk_size(&self) -> u32 {
+        self.store.logs()
     }
 }
 
@@ -468,14 +600,41 @@ impl Clone for LogKvsEngine {
 
 impl KvsEngine for LogKvsEngine {
     fn set(&self, key: String, value: String) -> Result<()> {
-        self.store.write()?.set(key, value)
+        self.store.to_writer()?.set(key, value)?;
+        if self.store.should_compact() {
+            self.store.compact()?;
+        }
+        Ok(())
     }
 
     fn get(&self, key: String) -> Result<Option<String>> {
-        self.store.write()?.get(key)
+        self.store.to_reader()?.get(key)
     }
 
     fn remove(&self, key: String) -> Result<()> {
-        self.store.write()?.remove(key)
+        self.store.to_writer()?.remove(key)?;
+        if self.store.should_compact() {
+            self.store.compact()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempfile;
+
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn pread_exact() {
+        let mut file = tempfile().unwrap();
+        file.write_all(b"Hello, world!").unwrap();
+
+        let mut buf = [0u8; 5];
+        read_exact_at(&file, &mut buf, 7).unwrap();
+
+        assert_eq!(&buf, b"world");
     }
 }

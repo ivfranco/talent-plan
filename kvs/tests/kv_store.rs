@@ -87,7 +87,7 @@ fn compaction() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let store = KvStore::open(temp_dir.path())?;
 
-    let mut current_size = store.on_disk_size()?;
+    let mut current_size = store.on_disk_size();
     for iter in 0..1000 {
         for key_id in 0..1000 {
             let key = format!("key{}", key_id);
@@ -95,7 +95,7 @@ fn compaction() -> Result<()> {
             store.set(key, value)?;
         }
 
-        let new_size = store.on_disk_size()?;
+        let new_size = store.on_disk_size();
         if new_size > current_size {
             current_size = new_size;
             continue;
