@@ -14,20 +14,37 @@ pub enum ServerOrder {
     Shutdown,
 }
 
-/// The shutdown switch of the a [Listener](Listener).
+/// The shutdown switch of a [Listener](Listener).
 pub struct ShutdownSwitch {
     shutdown_tx: oneshot::Sender<()>,
+    join_handle: JoinHandle<()>,
 }
 
 impl ShutdownSwitch {
-    /// Shutdown the corresponding [Listener](Listener).
+    /// Shutdown the corresponding [Listener](Listener). Block until the listener thread is
+    /// terminated.
     pub fn shutdown(self) {
-        self.shutdown_tx.send(()).unwrap();
+        if self.shutdown_tx.send(()).is_err() {
+            warn!("Listener already terminated");
+        }
+
+        let _ = self.join_handle.join();
+    }
+
+    /// Shutdown the corresponding [Listener](Listener), but do not wait for it to terminate.
+    pub fn shutdown_non_blocking(self) {
+        if self.shutdown_tx.send(()).is_err() {
+            warn!("Listener already terminated");
+        }
+    }
+
+    /// Block the current thread until the listener thread is terminated.
+    pub fn block(self) {
+        let _ = self.join_handle.join();
     }
 }
 
-/// A TcpListener that can be remotely shutdown without resorting to SIGTERM or
-/// SIGKILL.
+/// A TcpListener that can be remotely shutdown without resorting to SIGTERM or SIGKILL.
 pub struct Listener {
     listener: TcpListener,
     shutdown_rx: oneshot::Receiver<()>,
@@ -37,12 +54,9 @@ pub struct Listener {
 impl Listener {
     /// Spawn the TcpListener in another thread, return a handle to that thread
     /// and the shutdown switch.
-    pub fn spawn(
-        addr: SocketAddr,
-        order_tx: Sender<ServerOrder>,
-    ) -> (JoinHandle<()>, ShutdownSwitch) {
+    pub fn spawn(addr: SocketAddr, order_tx: Sender<ServerOrder>) -> ShutdownSwitch {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let handle = thread::spawn(move || {
+        let join_handle = thread::spawn(move || {
             let rt = runtime::Builder::new_current_thread()
                 .enable_io()
                 .build()
@@ -52,7 +66,10 @@ impl Listener {
                 .unwrap();
         });
 
-        (handle, ShutdownSwitch { shutdown_tx })
+        ShutdownSwitch {
+            shutdown_tx,
+            join_handle,
+        }
     }
 
     async fn bind(
@@ -85,15 +102,22 @@ impl Listener {
             match select(&mut shutdown_rx, stream).await {
                 Either::Left((..)) => {
                     // either the switch is pushed, or the switch is dropped
-                    let _ = order_tx.send(ServerOrder::Shutdown);
+                    if order_tx.send(ServerOrder::Shutdown).is_err() {
+                        warn!("Shutdown switch dropped, terminate listener");
+                    }
                     break;
                 }
                 Either::Right((item, _)) => match item {
                     Ok((s, _)) => {
-                        let _ = order_tx.send(ServerOrder::Stream(s.into_std()?));
+                        let stream = s.into_std()?;
+                        stream.set_nonblocking(false)?;
+                        if order_tx.send(ServerOrder::Stream(stream)).is_err() {
+                            warn!("Order receiver dropped, terminate listener");
+                            break;
+                        }
                     }
                     Err(e) => {
-                        eprintln!("On accepting TCP stream: {}", e);
+                        warn!("On accepting TCP stream: {}", e);
                     }
                 },
             }
@@ -114,18 +138,19 @@ mod tests {
         let mut addr = server::default_addr();
         addr.set_port(4001);
         let (order_tx, _order_rx) = channel();
-        let (handle, switch) = Listener::spawn(addr, order_tx);
+        let switch = Listener::spawn(addr, order_tx);
 
         switch.shutdown();
-        handle.join().unwrap();
     }
 
     #[test]
     fn listener_send_stream() {
+        env_logger::init();
+
         let mut addr = server::default_addr();
         addr.set_port(4002);
         let (order_tx, order_rx) = channel();
-        let (handle, switch) = Listener::spawn(addr, order_tx);
+        let switch = Listener::spawn(addr, order_tx);
 
         for _ in 0..10 {
             thread::spawn(move || {
@@ -138,7 +163,8 @@ mod tests {
             order_rx.recv().unwrap();
         }
 
+        assert!(order_rx.try_recv().is_err());
+
         switch.shutdown();
-        handle.join().unwrap();
     }
 }

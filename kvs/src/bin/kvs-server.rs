@@ -51,11 +51,11 @@ fn run_with_flavor(flavor: Flavor, addr: Option<SocketAddr>) -> Result<(), CmdEr
     match flavor {
         Flavor::Kvs => {
             let engine = LogKvsEngine::open(&cwd)?;
-            KvsServer::open(engine, pool).listen(addr)?;
+            KvsServer::open(engine, pool).listen_on_current(addr)?;
         }
         Flavor::Sled => {
             let engine = SledKvsEngine::open(&cwd)?;
-            KvsServer::open(engine, pool).listen(addr)?;
+            KvsServer::open(engine, pool).listen_on_current(addr)?;
         }
     }
 

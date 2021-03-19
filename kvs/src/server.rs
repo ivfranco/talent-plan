@@ -1,6 +1,8 @@
 use crate::{
-    sled_engine::SLED_STORE_DIR, thread_pool::ThreadPool, Command, Error as KvsError, KvsEngine,
-    STORE_NAME,
+    listener::{Listener, ServerOrder, ShutdownSwitch},
+    sled_engine::SLED_STORE_DIR,
+    thread_pool::ThreadPool,
+    Command, Error as KvsError, KvsEngine, STORE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,6 +11,8 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     path::Path,
     str::FromStr,
+    sync::mpsc::{channel, Receiver},
+    thread,
 };
 use thiserror::Error;
 
@@ -109,14 +113,47 @@ pub struct KvsServer<E: KvsEngine, P: ThreadPool> {
     pool: P,
 }
 
-impl<E: KvsEngine, P: ThreadPool> KvsServer<E, P> {
+impl<E, P> KvsServer<E, P>
+where
+    E: KvsEngine,
+    P: ThreadPool,
+{
     /// Start the server with the provided key-value store engine and thread pool.
     pub fn open(engine: E, pool: P) -> Self {
         Self { engine, pool }
     }
 
-    /// Start accepting and serving incoming requests from clients on the address.
-    pub fn listen(&self, addr: Option<SocketAddr>) -> Result<(), Error> {
+    /// Spawn the server on another thread, return the remote shutdown switch.
+    pub fn spawn(self, addr: Option<SocketAddr>) -> ShutdownSwitch {
+        let addr = addr.unwrap_or_else(default_addr);
+        info!("Listening at {}...", addr);
+
+        let (order_tx, order_rx) = channel();
+        let switch = Listener::spawn(addr, order_tx);
+
+        thread::spawn(move || self.listen(order_rx));
+
+        switch
+    }
+
+    fn listen(self, order_rx: Receiver<ServerOrder>) {
+        for order in order_rx {
+            match order {
+                ServerOrder::Stream(stream) => {
+                    info!("Accepted connection from {:?}", stream.peer_addr());
+                    self.serve(stream);
+                }
+                ServerOrder::Shutdown => {
+                    info!("Received shutdown order");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Start accepting and serving incoming requests from clients on the
+    /// address on the current thread.
+    pub fn listen_on_current(&self, addr: Option<SocketAddr>) -> Result<(), Error> {
         let addr = addr.unwrap_or_else(default_addr);
         info!("Listening at {}...", addr);
 

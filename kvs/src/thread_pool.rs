@@ -4,7 +4,7 @@ use std::thread;
 
 /// A thread pool used to execute jobs on a fixed number of threads. When the
 /// ThreadPool goes out of scope every worker thread is shut down.
-pub trait ThreadPool: Sized {
+pub trait ThreadPool: Sized + Send + 'static {
     /// Creates a new thread pool, immediately spawning the specified number of
     /// threads.
     /// # Errors

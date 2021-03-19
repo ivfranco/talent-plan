@@ -23,6 +23,7 @@ pub mod thread_pool;
 /// SIGKILL.
 pub mod listener;
 
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -31,7 +32,10 @@ use std::{
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     mem,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, PoisonError, RwLock,
+    },
 };
 use thiserror::Error;
 
@@ -134,8 +138,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A persistent log-structured key-value store of pairs of Strings. Currently
 /// commands are serialized to JSON for readability.
 pub struct KvStore {
-    handle: BufWriter<File>,
-    indices: Option<Indices>,
+    writer: BufWriter<File>,
+    indices: Indices,
     dir: PathBuf,
 }
 
@@ -164,11 +168,13 @@ impl KvStore {
             .append(true)
             .open(&path)?;
 
+        file.seek(SeekFrom::Start(0))?;
+        let indices = build_indices(&mut file)?;
         file.seek(SeekFrom::End(0))?;
 
         Ok(Self {
-            handle: BufWriter::new(file),
-            indices: None,
+            writer: BufWriter::new(file),
+            indices,
             dir,
         })
     }
@@ -187,7 +193,7 @@ impl KvStore {
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
         let pos = self.pos()?;
         self.append(&Command::Set(key.clone(), value))?;
-        self.indices()?.insert(key, pos);
+        self.indices.insert(key, pos);
         self.compact()?;
         Ok(())
     }
@@ -205,7 +211,7 @@ impl KvStore {
     /// # }
     /// ```
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        let value_pos = if let Some(pos) = self.indices()?.get(&key) {
+        let value_pos = if let Some(pos) = self.indices.get(&key) {
             pos
         } else {
             return Ok(None);
@@ -228,18 +234,18 @@ impl KvStore {
     /// # }
     /// ```
     pub fn remove(&mut self, key: String) -> Result<()> {
-        if !self.indices()?.contains_key(&key) {
+        if !self.indices.contains_key(&key) {
             Err(Error::KeyNotFound)
         } else {
             self.append(&Command::Remove(key.clone()))?;
-            self.indices()?.remove(&key);
+            self.indices.remove(&key);
             self.compact()?;
             Ok(())
         }
     }
 
     fn pos(&mut self) -> Result<u64> {
-        self.handle
+        self.writer
             // skip the flush
             .get_mut()
             // this seek is safe because the write position is not actually
@@ -248,95 +254,50 @@ impl KvStore {
             .map_err(From::from)
     }
 
-    fn indices(&mut self) -> Result<&mut Indices> {
-        if self.indices.is_none() {
-            self.indices = Some(self.build_indices()?);
-        }
-
-        // the only way to express this until `Option::insert` is stabilized
-        Ok(self.indices.as_mut().unwrap())
-    }
-
-    fn build_indices(&mut self) -> Result<Indices> {
-        // BufWriter::seek always flushes the internal buffer
-        self.handle.seek(SeekFrom::Start(0))?;
-
-        let file = self.handle.get_mut();
-        let mut de = serde_json::Deserializer::from_reader(file).into_iter();
-        let mut indices = Indices::new();
-
-        loop {
-            let pos = de.byte_offset() as u64;
-            match de.next().transpose()? {
-                Some(Command::Set(key, _)) => {
-                    indices.insert(key, pos);
-                }
-                Some(Command::Remove(key)) => {
-                    indices.remove(&key);
-                }
-                Some(..) => {
-                    return Err(Error::StoreFileCorrupted(
-                        pos,
-                        Corruption::UnexpectedCommandInStorage,
-                    ));
-                }
-                None => {
-                    break;
-                }
-            }
-        }
-
-        Ok(indices)
-    }
-
     // Calls to KvStore::set and KvStore::remove, when the indice is in place,
     // should not force the BufWriter to be flushed (mainly by seek), as a
     // consequence other public methods must seek to the end of the file on
     // exit.
     fn append(&mut self, command: &Command) -> Result<()> {
-        append(&mut self.handle, command)
+        append(&mut self.writer, command)
     }
 
     fn read_value_from(&mut self, pos: u64) -> Result<String> {
-        self.handle.flush()?;
-        let value = match seek_read_from(self.handle.get_ref(), pos)? {
+        self.writer.flush()?;
+        let value = match seek_read_from(self.writer.get_ref(), pos)? {
             Command::Set(_, value) => value,
             _ => return Err(Error::StoreFileCorrupted(pos, Corruption::HasNoValue)),
         };
-        self.handle.seek(SeekFrom::End(0))?;
+        self.writer.seek(SeekFrom::End(0))?;
         Ok(value)
     }
 
     /// The compaction test always succeeds on x86_64-pc-windows-msvc, the first
     /// step towards a functioning compaction strategy is to make the test fail
     /// when it should.
-    pub fn on_disk_size(&mut self) -> Result<u64> {
-        let file = self.handle.get_mut();
-        let start = file.seek(SeekFrom::Start(0))?;
-        file.seek(SeekFrom::End(0))
-            .map(|end| end - start)
-            .map_err(From::from)
+    pub fn logs(&self) -> u32 {
+        self.indices.logs()
     }
 
     fn compact(&mut self) -> Result<()> {
-        self.handle.flush()?;
+        self.writer.flush()?;
 
-        if !self.indices()?.should_compact() {
+        if !self.indices.should_compact() {
             return Ok(());
         }
-        let indices = mem::take(self.indices()?);
+        let indices = mem::take(&mut self.indices);
 
         let dir = self.dir.clone();
         let mut backup = BufWriter::new(File::create(dir.join(BACKUP_NAME))?);
 
-        for (key, pos) in indices.into_iter() {
+        for (key, pos) in indices.iter() {
             let value = self.read_value_from(pos)?;
             append(&mut backup, &Command::Set(key, value))?;
         }
         backup.flush()?;
 
         // otherwise renaming 1.kvs to 0.kvs will cause permission error
-        self.handle = backup;
+        self.writer = backup;
 
         std::fs::rename(dir.join(BACKUP_NAME), dir.join(STORE_NAME))?;
         *self = Self::open(dir)?;
@@ -350,37 +311,35 @@ fn append<W: Write>(writer: W, command: &Command) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct Stats {
     // The number of logs on disk.
-    logs: u32,
+    logs: AtomicU32,
     // The number of values on disk.
-    values: u32,
+    values: AtomicU32,
 }
 
 impl Stats {
-    fn update(&mut self, is_overwrite: bool) {
+    fn update(&self, is_overwrite: bool) {
         if !is_overwrite {
-            self.values += 1;
+            self.values.fetch_add(1, Ordering::Release);
         }
-        self.logs += 1;
+        self.logs.fetch_add(1, Ordering::Release);
     }
 
     fn utilization(&self) -> f64 {
-        self.values as f64 / self.logs as f64
+        self.values.load(Ordering::Acquire) as f64 / self.logs.load(Ordering::Acquire) as f64
     }
 
     fn should_compact(&self) -> bool {
-        self.utilization() < 0.25 && self.logs >= 100_000
+        self.utilization() < 0.25 && self.logs.load(Ordering::Acquire) >= 100_000
     }
 }
 
-type Revision = u32;
-
+/// Indices into the on-disk store file.
 #[derive(Default)]
 struct Indices {
-    // TODO: make use of revisions.
-    inner: HashMap<String, (Option<u64>, Revision)>,
+    inner: DashMap<String, u64>,
     stats: Stats,
 }
 
@@ -389,30 +348,22 @@ impl Indices {
         Self::default()
     }
 
-    fn insert(&mut self, key: String, pos: u64) {
-        match self.inner.entry(key) {
-            Entry::Occupied(mut e) => {
-                let (_, rev) = *e.get();
-                e.insert((Some(pos), rev + 1));
-                self.stats.update(true);
-            }
-            Entry::Vacant(e) => {
-                e.insert((Some(pos), 0));
-                self.stats.update(false);
-            }
-        }
+    fn logs(&self) -> u32 {
+        self.stats.logs.load(Ordering::Acquire)
     }
 
-    fn remove(&mut self, key: &str) {
-        if let Some((pos, rev)) = self.inner.get_mut(key) {
-            *pos = None;
-            *rev += 1;
-            self.stats.update(true);
-        }
+    fn insert(&self, key: String, pos: u64) {
+        let is_overwrite = self.inner.insert(key, pos).is_some();
+        self.stats.update(is_overwrite);
+    }
+
+    fn remove(&self, key: &str) {
+        let is_overwrite = self.inner.remove(key).is_some();
+        self.stats.update(is_overwrite);
     }
 
     fn get(&self, key: &str) -> Option<u64> {
-        self.inner.get(key).and_then(|(pos, _)| *pos)
+        self.inner.get(key).map(|entry| *entry.value())
     }
 
     fn contains_key(&self, key: &str) -> bool {
@@ -423,21 +374,19 @@ impl Indices {
         self.stats.should_compact()
     }
 
-    fn into_iter(self) -> impl Iterator<Item = (String, u64)> {
+    fn iter(&self) -> impl Iterator<Item = (String, u64)> + '_ {
         self.inner
-            .into_iter()
-            .filter_map(|(key, (pos, _))| pos.map(|pos| (key, pos)))
+            .iter()
+            .map(|entry| (entry.key().to_string(), *entry.value()))
     }
 }
 
 fn seek_read_from<R: Read + Seek>(mut reader: R, pos: u64) -> Result<Command> {
     reader.seek(SeekFrom::Start(pos))?;
-    // The non-streaming deserializer will check if the character after the
-    // value is EOF or whitespace and throw an error otherwise, there's no
-    // way to match against a specific ErrorCode from serde_json (it's
-    // private), as a result serde_json::StreamDeserializer which skips this
-    // check is the only way to read a JSON value from the middle of an input
-    // stream.
+    // The non-streaming deserializer will check if the character after the value is EOF or
+    // whitespace and throw an error otherwise, there's no way to match against a specific ErrorCode
+    // from serde_json (it's private), as a result serde_json::StreamDeserializer which skips this
+    // check is the only way to read a JSON value from the middle of an input stream.
     let mut de = serde_json::Deserializer::from_reader(reader).into_iter::<Command>();
 
     match de.next().transpose()? {
@@ -449,21 +398,49 @@ fn seek_read_from<R: Read + Seek>(mut reader: R, pos: u64) -> Result<Command> {
     }
 }
 
+fn build_indices<R: Read>(reader: R) -> Result<Indices> {
+    let mut de = serde_json::Deserializer::from_reader(reader).into_iter();
+    let indices = Indices::new();
+
+    loop {
+        let pos = de.byte_offset() as u64;
+        match de.next().transpose()? {
+            Some(Command::Set(key, _)) => {
+                indices.insert(key, pos);
+            }
+            Some(Command::Remove(key)) => {
+                indices.remove(&key);
+            }
+            Some(..) => {
+                return Err(Error::StoreFileCorrupted(
+                    pos,
+                    Corruption::UnexpectedCommandInStorage,
+                ));
+            }
+            None => {
+                break;
+            }
+        }
+    }
+
+    Ok(indices)
+}
+
 /// A key-value store that supports Set, Get and Remove operations.
 pub trait KvsEngine: Clone + Send + 'static {
     /// Set or overwite a string key to a string value in the key-value store.
     fn set(&self, key: String, value: String) -> Result<()>;
-    /// Get the value corresponding to a string key in the key-value store,
-    /// return None if the key doesn't exist.
+    /// Get the value corresponding to a string key in the key-value store, return None if the key
+    /// doesn't exist.
     fn get(&self, key: String) -> Result<Option<String>>;
-    /// Delete a string key and the corresponding value from the key-value
-    /// store. Return an error when the key doesn't exist.
+    /// Delete a string key and the corresponding value from the key-value store. Return an error
+    /// when the key doesn't exist.
     fn remove(&self, key: String) -> Result<()>;
 }
 
 /// Sharable [KvStore](KvStore).
 pub struct LogKvsEngine {
-    store: Arc<Mutex<KvStore>>,
+    store: Arc<RwLock<KvStore>>,
 }
 
 impl LogKvsEngine {
@@ -471,13 +448,13 @@ impl LogKvsEngine {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let store = KvStore::open(path)?;
         Ok(Self {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(RwLock::new(store)),
         })
     }
 
     /// Exposed for tests.
-    pub fn on_disk_size(&self) -> Result<u64> {
-        self.store.lock()?.on_disk_size()
+    pub fn on_disk_size(&self) -> Result<u32> {
+        Ok(self.store.read()?.logs())
     }
 }
 
@@ -491,14 +468,14 @@ impl Clone for LogKvsEngine {
 
 impl KvsEngine for LogKvsEngine {
     fn set(&self, key: String, value: String) -> Result<()> {
-        self.store.lock()?.set(key, value)
+        self.store.write()?.set(key, value)
     }
 
     fn get(&self, key: String) -> Result<Option<String>> {
-        self.store.lock()?.get(key)
+        self.store.write()?.get(key)
     }
 
     fn remove(&self, key: String) -> Result<()> {
-        self.store.lock()?.remove(key)
+        self.store.write()?.remove(key)
     }
 }
