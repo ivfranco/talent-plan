@@ -249,7 +249,7 @@ impl KvStore {
         }
 
         // sanity check
-        assert!(self.stats.utilization() - 1.0 < 1e-10);
+        assert!(1.0 - self.stats.utilization() < 1e-10);
         assert_eq!(self.indices.len(), self.logs() as usize);
 
         Ok(())
