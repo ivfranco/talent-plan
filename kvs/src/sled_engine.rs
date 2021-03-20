@@ -50,7 +50,7 @@ impl SledKvsEngine {
         }
     }
 
-    /// Removes a key from the store.
+    /// Removes a key from the store. Return true if an old value is removed.
     pub fn remove(&self, key: String) -> Result<bool, SledError> {
         let value = self.db.remove(key)?;
         self.db.flush()?;
@@ -61,18 +61,18 @@ impl SledKvsEngine {
 impl KvsEngine for SledKvsEngine {
     fn set(&self, key: String, value: String) -> futures::future::BoxFuture<crate::Result<()>> {
         let engine = self.clone();
-        future::lazy(move |_| self.set(key, value).map_err(From::from)).boxed()
+        future::lazy(move |_| engine.set(key, value).map_err(From::from)).boxed()
     }
 
     fn get(&self, key: String) -> futures::future::BoxFuture<crate::Result<Option<String>>> {
         let engine = self.clone();
-        future::lazy(move |_| self.get(key).map_err(From::from)).boxed()
+        future::lazy(move |_| engine.get(key).map_err(From::from)).boxed()
     }
 
     fn remove(&self, key: String) -> futures::future::BoxFuture<crate::Result<()>> {
         let engine = self.clone();
         future::lazy(move |_| {
-            if SledKvsEngine::remove(self, key)? {
+            if engine.remove(key)? {
                 Ok(())
             } else {
                 Err(KvError::KeyNotFound)

@@ -7,6 +7,10 @@ extern crate log;
 
 /// Error handling functionalities for command line applications.
 pub mod cmd;
+
+/// Protocol for server-client communication.
+pub mod protocol;
+
 /// A persistent key-value store server.
 pub mod server;
 
@@ -111,7 +115,7 @@ pub enum Corruption {
 }
 
 /// Command used both in on-disk store and network protocol.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum Command {
     /// Set the value of a string key to a string value.
     Set(String, String),
@@ -137,9 +141,10 @@ pub trait KvsEngine: Clone + Send + 'static {
     ///
     /// ```rust
     /// # use kvs::{KvsEngine, log_engine::LogKvsEngine, Result};
-    /// # fn main() -> Result<()> {
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
     /// let engine = LogKvsEngine::open(tempfile::tempdir()?)?;
-    /// engine.set("key".to_string(), "value".to_string())?;
+    /// engine.set("key".to_string(), "value".to_string()).await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -151,11 +156,12 @@ pub trait KvsEngine: Clone + Send + 'static {
     ///
     /// ```rust
     /// # use kvs::{KvsEngine, log_engine::LogKvsEngine, Result};
-    /// # fn main() -> Result<()> {
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
     /// let engine = LogKvsEngine::open(tempfile::tempdir()?)?;
-    /// engine.set("key".to_string(), "value".to_string())?;
-    /// assert_eq!(engine.get("key".to_string())?, Some("value".to_string()));
-    /// assert_eq!(engine.get("none".to_string())?, None);
+    /// engine.set("key".to_string(), "value".to_string()).await?;
+    /// assert_eq!(engine.get("key".to_string()).await?, Some("value".to_string()));
+    /// assert_eq!(engine.get("none".to_string()).await?, None);
     /// # Ok(())
     /// # }
     /// ```
@@ -167,13 +173,14 @@ pub trait KvsEngine: Clone + Send + 'static {
     ///
     /// ```rust
     /// # use kvs::{KvsEngine, log_engine::LogKvsEngine, Result};
-    /// # fn main() -> Result<()> {
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
     /// let engine = LogKvsEngine::open(tempfile::tempdir()?)?;
-    /// engine.set("key".to_string(), "value".to_string())?;
-    /// assert_eq!(engine.get("key".to_string())?, Some("value".to_string()));
-    /// engine.remove("key".to_string())?;
-    /// assert_eq!(engine.get("key".to_string())?, None);
-    /// assert!(engine.remove("key".to_string()).is_err());
+    /// engine.set("key".to_string(), "value".to_string()).await?;
+    /// assert_eq!(engine.get("key".to_string()).await?, Some("value".to_string()));
+    /// engine.remove("key".to_string()).await?;
+    /// assert_eq!(engine.get("key".to_string()).await?, None);
+    /// assert!(engine.remove("key".to_string()).await.is_err());
     /// # Ok(())
     /// # }
     /// ```

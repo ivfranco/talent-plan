@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, ToSocketAddrs};
 
 /// The orders a [Listener](Listener) can give to a [KvsServer](KvsServer).
 pub enum ServerOrder {
@@ -38,7 +38,7 @@ pub struct Listener {
 
 impl Listener {
     /// Spawn the TcpListener as a task, return the shutdown switch.
-    pub async fn wire(addr: SocketAddr) -> io::Result<(Self, ShutdownSwitch)> {
+    pub async fn wire<A: ToSocketAddrs>(addr: A) -> io::Result<(Self, ShutdownSwitch)> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let this = Self {
@@ -67,29 +67,31 @@ impl Stream for Listener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server;
+    use crate::{protocol::Error, server};
     use futures::stream::StreamExt;
     use std::time::Duration;
     use tokio::net::TcpStream;
 
     #[tokio::test]
-    async fn listener_shutdown() {
+    async fn listener_shutdown() -> Result<(), Error> {
         let mut addr = server::default_addr();
         addr.set_port(4005);
-        let (mut listener, switch) = Listener::wire(addr).await.unwrap();
+        let (mut listener, switch) = Listener::wire(addr).await?;
         let join = tokio::spawn(async move {
             listener.next().await;
         });
 
         switch.shutdown().await;
         assert!(join.await.is_ok());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn listener_recv_stream() {
+    async fn listener_recv_stream() -> Result<(), Error> {
         let mut addr = server::default_addr();
         addr.set_port(4006);
-        let (mut listener, switch) = Listener::wire(addr).await.unwrap();
+        let (mut listener, switch) = Listener::wire(addr).await?;
 
         for _ in 0u8..10 {
             tokio::spawn(async move {
@@ -105,5 +107,7 @@ mod tests {
 
         switch.shutdown().await;
         assert!(listener.next().await.is_none());
+
+        Ok(())
     }
 }

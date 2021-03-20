@@ -1,9 +1,8 @@
 use kvs::{
     cmd::*,
     log_engine::LogKvsEngine,
-    server::{choose_flavor, Flavor, KvsServer},
+    server::{choose_flavor, default_addr, Flavor, KvsServer},
     sled_engine::SledKvsEngine,
-    thread_pool::{SharedQueueThreadPool, ThreadPool},
 };
 use log::{info, LevelFilter};
 use pico_args::Arguments;
@@ -18,12 +17,12 @@ async fn main() {
     info!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
 
     let args = Arguments::from_env();
-    if let Err(err) = cmd(args) {
+    if let Err(err) = cmd(args).await {
         error_exit(err, env!("CARGO_BIN_NAME"));
     }
 }
 
-fn cmd(mut args: Arguments) -> Result<(), CmdError> {
+async fn cmd(mut args: Arguments) -> Result<(), CmdError> {
     if args.contains(["-h", "--help"]) {
         help(env!("CARGO_BIN_NAME"), HELP);
         return Ok(());
@@ -34,30 +33,31 @@ fn cmd(mut args: Arguments) -> Result<(), CmdError> {
         return Ok(());
     }
 
-    let addr: Option<SocketAddr> = args.opt_value_from_str("--addr")?;
+    let addr: SocketAddr = args
+        .opt_value_from_str("--addr")?
+        .unwrap_or_else(default_addr);
     let flavor: Option<Flavor> = args.opt_value_from_str("--engine")?;
 
     no_more_args(args)?;
 
-    run_with_flavor(choose_flavor(flavor)?, addr)?;
+    run_with_flavor(choose_flavor(flavor)?, addr).await?;
 
     Ok(())
 }
 
-fn run_with_flavor(flavor: Flavor, addr: Option<SocketAddr>) -> Result<(), CmdError> {
+async fn run_with_flavor(flavor: Flavor, addr: SocketAddr) -> Result<(), CmdError> {
     let cwd = std::env::current_dir()?;
-    let pool = SharedQueueThreadPool::new(num_cpus::get() as u32)?;
 
     match flavor {
         Flavor::Kvs => {
             let engine = LogKvsEngine::open(&cwd)?;
-            // KvsServer::open(engine, pool).listen_on_current(addr)?;
-            unimplemented!()
+            let (server, _switch) = KvsServer::bind(engine, addr).await?;
+            server.listen().await?;
         }
         Flavor::Sled => {
             let engine = SledKvsEngine::open(&cwd)?;
-            // KvsServer::open(engine, pool).listen_on_current(addr)?;
-            unimplemented!()
+            let (server, _switch) = KvsServer::bind(engine, addr).await?;
+            server.listen().await?;
         }
     }
 
