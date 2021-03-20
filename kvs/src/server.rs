@@ -2,20 +2,22 @@ use crate::{
     listener::{Listener, ServerOrder, ShutdownSwitch},
     log_engine::LogKvsEngine,
     sled_engine::SledKvsEngine,
-    thread_pool::ThreadPool,
     Command, Error as KvsError, KvsEngine,
 };
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::{Debug, Display},
-    io::{Error as IOError, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    io::{Cursor, Error as IOError, Read, Write},
+    net::SocketAddr,
     path::Path,
     str::FromStr,
-    sync::mpsc::{channel, Receiver},
-    thread,
 };
 use thiserror::Error;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 /// This type represents all possible errors that can occur when operating the
 /// key-value store server and client.
@@ -111,66 +113,36 @@ impl Display for Response {
 /// A persistent key-value store server.
 pub struct KvsServer<E: KvsEngine> {
     engine: E,
+    listener: Listener,
 }
 
 impl<E: KvsEngine> KvsServer<E> {
     /// Start the server with the provided key-value store engine and thread pool.
-    pub fn open(engine: E) -> Self {
-        Self { engine }
+    pub async fn bind(engine: E, addr: SocketAddr) -> Result<(Self, ShutdownSwitch), Error> {
+        let (listener, switch) = Listener::wire(addr).await?;
+        let this = Self { engine, listener };
+        Ok((this, switch))
     }
 
-    /// Spawn the server on another thread, return the remote shutdown switch.
-    pub fn spawn(self, addr: Option<SocketAddr>) -> ShutdownSwitch {
-        unimplemented!()
-    }
-
-    fn listen(self, order_rx: Receiver<ServerOrder>) {
-        // for order in order_rx {
-        //     match order {
-        //         ServerOrder::Stream(stream) => {
-        //             info!("Accepted connection from {:?}", stream.peer_addr());
-        //             self.serve(stream);
-        //         }
-        //         ServerOrder::Shutdown => {
-        //             info!("Received shutdown order");
-        //             break;
-        //         }
-        //     }
-        // }
-        unimplemented!()
-    }
-
-    /// Start accepting and serving incoming requests from clients on the
-    /// address on the current thread.
-    pub fn listen_on_current(&self, addr: Option<SocketAddr>) -> Result<(), Error> {
-        let addr = addr.unwrap_or_else(default_addr);
-        info!("Listening at {}...", addr);
-
-        let listener = TcpListener::bind(addr)?;
-
-        for stream in listener.incoming() {
+    async fn listen(mut self) -> Result<(), Error> {
+        while let Some(stream) = self.listener.next().await {
             let stream = match stream {
-                Ok(stream) => {
-                    info!("Accepted connection from {:?}", stream.peer_addr());
-                    stream
+                Ok((stream, socket)) => {
+                    info!("Accepted TCP stream from {}", socket);
+
+                    let engine = self.engine.clone();
+                    tokio::spawn(async move {
+                        serve(engine, stream).await;
+                    });
                 }
-                Err(err) => {
-                    error!("On accepting TCP connection: {}", err);
+                Err(e) => {
+                    warn!("On accepting TCP streams: {}", e);
                     continue;
                 }
             };
-
-            self.serve(stream);
         }
 
         Ok(())
-    }
-
-    fn serve(&self, stream: TcpStream) {
-        // let engine = self.engine.clone();
-        // self.pool.spawn(move || serve(engine, stream));
-        //
-        unimplemented!()
     }
 }
 
@@ -199,67 +171,84 @@ pub fn choose_flavor(arg_flavor: Option<Flavor>) -> Result<Flavor, Error> {
     }
 }
 
-fn stream_deserialize<'de, R, D>(reader: R) -> Result<D, Error>
+async fn stream_deserialize<'de, R, D>(mut reader: R) -> Result<D, Error>
 where
-    R: Read,
+    R: AsyncRead + Unpin,
     D: Deserialize<'de>,
 {
-    let mut de = serde_json::Deserializer::from_reader(reader).into_iter::<D>();
+    let len = u32::from_be(reader.read_u32().await?);
+    let mut buf = vec![0u8; len as usize];
+    reader.read_exact(&mut buf).await?;
+
+    let mut de = serde_json::Deserializer::from_reader(Cursor::new(buf)).into_iter::<D>();
 
     match de.next().transpose()? {
-        Some(d) => Ok(d),
+        Some(item) => Ok(item),
         None => Err(Error::UnexpectedEOF),
     }
 }
 
-fn write_response(mut stream: &TcpStream, response: &Response) -> Result<(), Error> {
-    serde_json::to_writer(stream, response).map_err(IOError::from)?;
-    stream.flush()?;
+async fn write_response(stream: &mut TcpStream, response: &Response) -> Result<(), Error> {
+    let buf = serde_json::to_vec(response)?;
+    let len = (buf.len() as u32).to_be();
+
+    // serde cannot handle WouldBlock, the serialized command must be first asynchronically read
+    // into a local buffer, to decide how much bytes must be read each message has to be tagged
+    // with a length.
+    stream.write_u32(len).await?;
+    stream.write_all(&buf).await?;
+
     Ok(())
 }
 
-fn try_serve<E: KvsEngine>(engine: E, stream: &TcpStream) -> Result<(), Error> {
-    // let command = stream_deserialize(stream)?;
+async fn try_serve<E: KvsEngine>(engine: E, stream: &mut TcpStream) -> Result<(), Error> {
+    let command = stream_deserialize(&mut *stream).await?;
 
-    // info!(
-    //     "Received command from {:?}: {}",
-    //     stream.peer_addr(),
-    //     command
-    // );
+    info!(
+        "Received command from {:?}: {}",
+        stream.peer_addr(),
+        command
+    );
 
-    // let response = match command {
-    //     Command::Get(key) => {
-    //         let value = engine.get(key)?;
-    //         Response::Value(value)
-    //     }
-    //     Command::Set(key, value) => {
-    //         engine.set(key, value)?;
-    //         Response::Ok
-    //     }
-    //     Command::Remove(key) => {
-    //         engine.remove(key)?;
-    //         Response::Ok
-    //     }
-    // };
+    let response = match command {
+        Command::Get(key) => {
+            // still can't understand why
+            // ```
+            // let value = engine.get(key).await?;
+            // ```
+            // will capture a reference engine
+            let get = engine.get(key);
+            let value = get.await?;
+            Response::Value(value)
+        }
+        Command::Set(key, value) => {
+            let set = engine.set(key, value);
+            set.await?;
+            Response::Ok
+        }
+        Command::Remove(key) => {
+            let remove = engine.remove(key);
+            remove.await?;
+            Response::Ok
+        }
+    };
 
-    // write_response(stream, &response)?;
-    // info!("Sent response to {:?}: {}", stream.peer_addr(), response);
-    // Ok(())
-    //
-    unimplemented!()
+    write_response(stream, &response).await?;
+    info!("Sent response to {:?}: {}", stream.peer_addr(), response);
+    Ok(())
 }
 
-fn handle_errors(err: Error, stream: &TcpStream) {
+async fn handle_errors(err: Error, stream: &mut TcpStream) {
     error!("On serving client via TCP: {}", err);
     // the stream is likely unusable on a net error
     if !matches!(err, Error::Net(..)) {
-        let _ = write_response(stream, &Response::Err(err.to_string()));
+        let _ = write_response(stream, &Response::Err(err.to_string())).await;
     }
 }
 
-fn serve<E: KvsEngine>(engine: E, stream: TcpStream) {
-    if let Err(e) = try_serve(engine, &stream) {
-        handle_errors(e, &stream);
+async fn serve<E: KvsEngine>(engine: E, mut stream: TcpStream) {
+    if let Err(e) = try_serve(engine, &mut stream).await {
+        handle_errors(e, &mut stream).await;
     }
 }
 

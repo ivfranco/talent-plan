@@ -70,7 +70,7 @@ pub enum Error {
 
     /// Other general unrecoverable errors.
     #[error("{0}")]
-    Other(Box<dyn Display>),
+    Other(Box<dyn Display + Send + Sync>),
 }
 
 impl Debug for Error {

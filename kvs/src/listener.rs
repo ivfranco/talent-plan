@@ -1,4 +1,4 @@
-use futures::{channel::oneshot, sink::SinkExt, FutureExt, Stream, StreamExt};
+use futures::{channel::oneshot, FutureExt, Stream};
 use std::{
     io,
     net::SocketAddr,
@@ -66,12 +66,11 @@ impl Stream for Listener {
 
 #[cfg(test)]
 mod tests {
-    use tokio::net::TcpStream;
-
-    use crate::server::{self, KvsServer};
-
     use super::*;
-    use std::{net::ToSocketAddrs, time::Duration};
+    use crate::server;
+    use futures::stream::StreamExt;
+    use std::time::Duration;
+    use tokio::net::TcpStream;
 
     #[tokio::test]
     async fn listener_shutdown() {
