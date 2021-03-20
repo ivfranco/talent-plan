@@ -1,16 +1,16 @@
-use std::net::SocketAddr;
-
 use kvs::{
     cmd::*,
+    log_engine::LogKvsEngine,
     server::{choose_flavor, Flavor, KvsServer},
     sled_engine::SledKvsEngine,
     thread_pool::{SharedQueueThreadPool, ThreadPool},
-    LogKvsEngine,
 };
 use log::{info, LevelFilter};
 use pico_args::Arguments;
+use std::net::SocketAddr;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
         .init();
@@ -51,11 +51,13 @@ fn run_with_flavor(flavor: Flavor, addr: Option<SocketAddr>) -> Result<(), CmdEr
     match flavor {
         Flavor::Kvs => {
             let engine = LogKvsEngine::open(&cwd)?;
-            KvsServer::open(engine, pool).listen_on_current(addr)?;
+            // KvsServer::open(engine, pool).listen_on_current(addr)?;
+            unimplemented!()
         }
         Flavor::Sled => {
             let engine = SledKvsEngine::open(&cwd)?;
-            KvsServer::open(engine, pool).listen_on_current(addr)?;
+            // KvsServer::open(engine, pool).listen_on_current(addr)?;
+            unimplemented!()
         }
     }
 

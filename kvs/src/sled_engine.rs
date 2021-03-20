@@ -1,4 +1,5 @@
 use crate::{Error as KvError, KvsEngine};
+use futures::{future, FutureExt};
 use sled::{Db, Error as SledError};
 use std::{path::Path, str::from_utf8};
 
@@ -18,6 +19,12 @@ impl SledKvsEngine {
         let db = sled::open(path.join(SLED_STORE_DIR))?;
         info!("Sled db was recovered: {}", db.was_recovered());
         Ok(Self { db })
+    }
+
+    /// Test whether sled engine is persistent under the given directory.
+    pub fn is_persistent<P: AsRef<Path>>(path: P) -> bool {
+        let path = path.as_ref();
+        path.is_dir() && path.join(SLED_STORE_DIR).is_dir()
     }
 
     /// Insert a key-value pair into the store.
@@ -52,20 +59,26 @@ impl SledKvsEngine {
 }
 
 impl KvsEngine for SledKvsEngine {
-    fn set(&self, key: String, value: String) -> Result<(), KvError> {
-        self.set(key, value).map_err(From::from)
+    fn set(&self, key: String, value: String) -> futures::future::BoxFuture<crate::Result<()>> {
+        let engine = self.clone();
+        future::lazy(move |_| self.set(key, value).map_err(From::from)).boxed()
     }
 
-    fn get(&self, key: String) -> Result<Option<String>, KvError> {
-        SledKvsEngine::get(self, key).map_err(From::from)
+    fn get(&self, key: String) -> futures::future::BoxFuture<crate::Result<Option<String>>> {
+        let engine = self.clone();
+        future::lazy(move |_| self.get(key).map_err(From::from)).boxed()
     }
 
-    fn remove(&self, key: String) -> Result<(), KvError> {
-        if SledKvsEngine::remove(self, key)? {
-            Ok(())
-        } else {
-            Err(KvError::KeyNotFound)
-        }
+    fn remove(&self, key: String) -> futures::future::BoxFuture<crate::Result<()>> {
+        let engine = self.clone();
+        future::lazy(move |_| {
+            if SledKvsEngine::remove(self, key)? {
+                Ok(())
+            } else {
+                Err(KvError::KeyNotFound)
+            }
+        })
+        .boxed()
     }
 }
 

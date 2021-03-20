@@ -1,8 +1,9 @@
 use crate::{
     listener::{Listener, ServerOrder, ShutdownSwitch},
-    sled_engine::SLED_STORE_DIR,
+    log_engine::LogKvsEngine,
+    sled_engine::SledKvsEngine,
     thread_pool::ThreadPool,
-    Command, Error as KvsError, KvsEngine, STORE_NAME,
+    Command, Error as KvsError, KvsEngine,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -108,47 +109,35 @@ impl Display for Response {
 }
 
 /// A persistent key-value store server.
-pub struct KvsServer<E: KvsEngine, P: ThreadPool> {
+pub struct KvsServer<E: KvsEngine> {
     engine: E,
-    pool: P,
 }
 
-impl<E, P> KvsServer<E, P>
-where
-    E: KvsEngine,
-    P: ThreadPool,
-{
+impl<E: KvsEngine> KvsServer<E> {
     /// Start the server with the provided key-value store engine and thread pool.
-    pub fn open(engine: E, pool: P) -> Self {
-        Self { engine, pool }
+    pub fn open(engine: E) -> Self {
+        Self { engine }
     }
 
     /// Spawn the server on another thread, return the remote shutdown switch.
     pub fn spawn(self, addr: Option<SocketAddr>) -> ShutdownSwitch {
-        let addr = addr.unwrap_or_else(default_addr);
-        info!("Initializing at {}...", addr);
-
-        let (order_tx, order_rx) = channel();
-        let switch = Listener::spawn(addr, order_tx);
-
-        thread::spawn(move || self.listen(order_rx));
-
-        switch
+        unimplemented!()
     }
 
     fn listen(self, order_rx: Receiver<ServerOrder>) {
-        for order in order_rx {
-            match order {
-                ServerOrder::Stream(stream) => {
-                    info!("Accepted connection from {:?}", stream.peer_addr());
-                    self.serve(stream);
-                }
-                ServerOrder::Shutdown => {
-                    info!("Received shutdown order");
-                    break;
-                }
-            }
-        }
+        // for order in order_rx {
+        //     match order {
+        //         ServerOrder::Stream(stream) => {
+        //             info!("Accepted connection from {:?}", stream.peer_addr());
+        //             self.serve(stream);
+        //         }
+        //         ServerOrder::Shutdown => {
+        //             info!("Received shutdown order");
+        //             break;
+        //         }
+        //     }
+        // }
+        unimplemented!()
     }
 
     /// Start accepting and serving incoming requests from clients on the
@@ -178,16 +167,17 @@ where
     }
 
     fn serve(&self, stream: TcpStream) {
-        let engine = self.engine.clone();
-        self.pool.spawn(move || serve(engine, stream));
+        // let engine = self.engine.clone();
+        // self.pool.spawn(move || serve(engine, stream));
+        //
+        unimplemented!()
     }
 }
 
 fn persisting_flavor<P: AsRef<Path>>(path: P) -> Option<Flavor> {
-    let path = path.as_ref();
-    if path.join(STORE_NAME).exists() {
+    if LogKvsEngine::is_persistent(&path) {
         Some(Flavor::Kvs)
-    } else if path.join(SLED_STORE_DIR).exists() {
+    } else if SledKvsEngine::is_persistent(&path) {
         Some(Flavor::Sled)
     } else {
         None
@@ -229,32 +219,34 @@ fn write_response(mut stream: &TcpStream, response: &Response) -> Result<(), Err
 }
 
 fn try_serve<E: KvsEngine>(engine: E, stream: &TcpStream) -> Result<(), Error> {
-    let command = stream_deserialize(stream)?;
+    // let command = stream_deserialize(stream)?;
 
-    info!(
-        "Received command from {:?}: {}",
-        stream.peer_addr(),
-        command
-    );
+    // info!(
+    //     "Received command from {:?}: {}",
+    //     stream.peer_addr(),
+    //     command
+    // );
 
-    let response = match command {
-        Command::Get(key) => {
-            let value = engine.get(key)?;
-            Response::Value(value)
-        }
-        Command::Set(key, value) => {
-            engine.set(key, value)?;
-            Response::Ok
-        }
-        Command::Remove(key) => {
-            engine.remove(key)?;
-            Response::Ok
-        }
-    };
+    // let response = match command {
+    //     Command::Get(key) => {
+    //         let value = engine.get(key)?;
+    //         Response::Value(value)
+    //     }
+    //     Command::Set(key, value) => {
+    //         engine.set(key, value)?;
+    //         Response::Ok
+    //     }
+    //     Command::Remove(key) => {
+    //         engine.remove(key)?;
+    //         Response::Ok
+    //     }
+    // };
 
-    write_response(stream, &response)?;
-    info!("Sent response to {:?}: {}", stream.peer_addr(), response);
-    Ok(())
+    // write_response(stream, &response)?;
+    // info!("Sent response to {:?}: {}", stream.peer_addr(), response);
+    // Ok(())
+    //
+    unimplemented!()
 }
 
 fn handle_errors(err: Error, stream: &TcpStream) {
