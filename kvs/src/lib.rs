@@ -9,22 +9,19 @@ extern crate log;
 pub mod cmd;
 
 /// Protocol for server-client communication.
-pub mod protocol;
+pub(crate) mod protocol;
 
-/// A persistent key-value store server.
+/// A server hosting a persistent key-value store.
 pub mod server;
 
-/// A persistent key-value store client.
+/// A client to a persistent key-value store.
 pub mod client;
 
-/// A log-structured implementation of key-value store engine.
+/// A log-structured implementation of key-value store.
 pub mod log_engine;
 
 /// An alternative persisten key-value store based on sled.
 pub mod sled_engine;
-
-/// Thread pool used to execute jobs in parallel on a fixed number of threads.
-pub mod thread_pool;
 
 /// A TcpListener that can be remotely shutdown without resorting to SIGTERM or
 /// SIGKILL.
