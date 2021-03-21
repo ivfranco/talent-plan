@@ -1,5 +1,5 @@
 use crate::{Error as KvError, KvsEngine};
-use futures::{future, FutureExt};
+use futures::{future, FutureExt, TryFutureExt};
 use sled::{Db, Error as SledError};
 use std::{path::Path, str::from_utf8};
 
@@ -28,14 +28,14 @@ impl SledKvsEngine {
     }
 
     /// Insert a key-value pair into the store.
-    pub fn set(&self, key: String, value: String) -> Result<(), SledError> {
+    pub async fn set(&self, key: String, value: String) -> Result<(), SledError> {
         self.db.insert(key, value.as_str())?;
         // `sled` by default caches all writes and only flushes to disk every 1000ms, a few tests
         // spawns the server on a child process then calls `std::process::Child::kill` on to
         // terminate it. At least on x86_64-pc-windows-msvc, `std::process::Child::kill` will skip
         // `Drop` implementations, when used as a KvsEngine the `sled::Db` must be flushed after
         // every modifying operation otherwise a few tests won't pass.
-        self.db.flush()?;
+        self.db.flush_async().await?;
         Ok(())
     }
 
@@ -51,17 +51,16 @@ impl SledKvsEngine {
     }
 
     /// Removes a key from the store. Return true if an old value is removed.
-    pub fn remove(&self, key: String) -> Result<bool, SledError> {
+    pub async fn remove(&self, key: String) -> Result<bool, SledError> {
         let value = self.db.remove(key)?;
-        self.db.flush()?;
+        self.db.flush_async().await?;
         Ok(value.is_some())
     }
 }
 
 impl KvsEngine for SledKvsEngine {
     fn set(&self, key: String, value: String) -> futures::future::BoxFuture<crate::Result<()>> {
-        let engine = self.clone();
-        future::lazy(move |_| engine.set(key, value).map_err(From::from)).boxed()
+        self.set(key, value).map_err(From::from).boxed()
     }
 
     fn get(&self, key: String) -> futures::future::BoxFuture<crate::Result<Option<String>>> {
@@ -70,15 +69,13 @@ impl KvsEngine for SledKvsEngine {
     }
 
     fn remove(&self, key: String) -> futures::future::BoxFuture<crate::Result<()>> {
-        let engine = self.clone();
-        future::lazy(move |_| {
-            if engine.remove(key)? {
-                Ok(())
-            } else {
-                Err(KvError::KeyNotFound)
-            }
-        })
-        .boxed()
+        self.remove(key)
+            .map(|res| match res {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(KvError::KeyNotFound),
+                Err(e) => Err(From::from(e)),
+            })
+            .boxed()
     }
 }
 
@@ -87,26 +84,26 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn sled_set() -> Result<(), SledError> {
+    #[tokio::test]
+    async fn sled_set() -> Result<(), SledError> {
         let store = SledKvsEngine::open(tempdir()?)?;
-        store.set("Key".to_string(), "Value".to_string())
+        store.set("Key".to_string(), "Value".to_string()).await
     }
 
-    #[test]
-    fn sled_get() -> Result<(), SledError> {
+    #[tokio::test]
+    async fn sled_get() -> Result<(), SledError> {
         let store = SledKvsEngine::open(tempdir()?)?;
-        store.set("Key".to_string(), "Value".to_string())?;
+        store.set("Key".to_string(), "Value".to_string()).await?;
         assert_eq!(store.get("Key".to_string())?, Some("Value".to_string()));
         Ok(())
     }
 
-    #[test]
-    fn sled_remove() -> Result<(), SledError> {
+    #[tokio::test]
+    async fn sled_remove() -> Result<(), SledError> {
         let store = SledKvsEngine::open(tempdir()?)?;
-        store.set("Key".to_string(), "Value".to_string())?;
+        store.set("Key".to_string(), "Value".to_string()).await?;
         assert_eq!(store.get("Key".to_string())?, Some("Value".to_string()));
-        store.remove("Key".to_string())?;
+        store.remove("Key".to_string()).await?;
         assert_eq!(store.get("Key".to_string())?, None);
         Ok(())
     }

@@ -455,6 +455,11 @@ impl KvsEngine for LogKvsEngine {
     fn get(&self, key: String) -> BoxFuture<Result<Option<String>>> {
         let engine = self.clone();
         futures::future::lazy(move |_| engine.get(key)).boxed()
+
+        // this doesn't make any sense at all, doing no search is about twice as slow as the current
+        // implementation of get that doesn't have a cache yet
+        //
+        // futures::future::lazy(|_|  Ok(Some("".to_string())) ).boxed()
     }
 
     fn remove(&self, key: String) -> BoxFuture<Result<()>> {
