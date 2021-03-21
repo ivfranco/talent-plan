@@ -1,5 +1,5 @@
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use futures::{stream, FutureExt, StreamExt};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use futures::{stream, Future, FutureExt, StreamExt};
 use kvs::{log_engine::LogKvsEngine, sled_engine::SledKvsEngine, KvsEngine};
 use rand::{
     distributions::{Alphanumeric, Distribution},
@@ -11,7 +11,8 @@ use std::{path::Path, sync::Arc};
 use tempfile::tempdir;
 use tokio::{
     runtime::{self, Runtime},
-    sync::Notify,
+    sync::Barrier,
+    task::JoinHandle,
 };
 
 struct StringLength {
@@ -43,42 +44,51 @@ async fn write_jobs<E: KvsEngine>(keys: Vec<String>, value: String, engine: &E) 
         .await;
 }
 
-async fn read_jobs<E: KvsEngine>(keys: Vec<String>, engine: E, notify: Arc<Notify>) {
-    let tasks = keys
-        .into_iter()
-        .map(|key| {
-            let engine = engine.clone();
-            let notify = notify.clone();
-            tokio::spawn(async move {
-                notify.notified().await;
-                let get = engine.get(key);
-                let value = get.await.unwrap();
-                assert!(value.is_some());
+fn spawn_paused_tasks<I, F, Fut>(rt: &Runtime, input: I, f: F) -> (Arc<Barrier>, JoinHandle<()>)
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    F: Fn(I::Item) -> Fut,
+    Fut: Future + Send + 'static,
+{
+    let iter = input.into_iter();
+    let spawn_barrier = Arc::new(Barrier::new(iter.len() + 1));
+    let exec_barrier = Arc::new(Barrier::new(iter.len() + 1));
+
+    let tasks = iter
+        .map(|i| {
+            let spawn_barrier = spawn_barrier.clone();
+            let exec_barrier = exec_barrier.clone();
+            let fut = f(i);
+            rt.spawn(async move {
+                spawn_barrier.wait().await;
+                exec_barrier.wait().await;
+                fut.await;
             })
         })
         .collect::<Vec<_>>();
 
-    stream::iter(tasks)
-        .for_each_concurrent(None, |fut| fut.map(|_| ()))
-        .await;
+    let handle = rt.spawn(stream::iter(tasks).for_each_concurrent(None, |fut| fut.map(|_| ())));
+    rt.block_on(spawn_barrier.wait());
+    // at this point all tasks are spawned in the runtime
+
+    (exec_barrier, handle)
 }
 
-fn init_inputs(seed: u64) -> (Vec<String>, String) {
-    const SAMPLE_SIZE: usize = 100;
-    const REPEAT: usize = 10;
+fn init_inputs(seed: u64, sample_size: usize, repeat: usize) -> (Vec<String>, String) {
     const KEY_LEN: usize = 1000;
     const VALUE_LEN: usize = 100;
 
     let mut rng = StdRng::seed_from_u64(seed);
     let keys = (&mut rng)
         .sample_iter(&StringLength { len: KEY_LEN })
-        .take(SAMPLE_SIZE)
+        .take(sample_size)
         .collect::<Vec<_>>();
     let value = (&mut rng).sample(&StringLength { len: VALUE_LEN });
 
     let mut keys = {
         let mut vec = vec![];
-        for _ in 0..REPEAT {
+        for _ in 0..repeat {
             vec.extend_from_slice(&keys);
         }
         vec
@@ -94,7 +104,10 @@ where
     E: KvsEngine,
     F: Fn(&Path) -> E,
 {
-    let (keys, value) = init_inputs(0x1234);
+    const SAMPLE_SIZE: usize = 100;
+    const REPEAT: usize = 10;
+
+    let (keys, value) = init_inputs(0x1234, SAMPLE_SIZE, REPEAT);
     let temp = tempdir().unwrap();
     let engine = constr(temp.path());
     {
@@ -116,18 +129,20 @@ where
             .unwrap();
 
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _n| {
-            b.iter_batched(
+            b.iter_with_setup(
                 || {
-                    let notify = Arc::new(Notify::new());
-                    let handle =
-                        runtime.spawn(read_jobs(keys.clone(), engine.clone(), notify.clone()));
-                    (notify, handle)
+                    spawn_paused_tasks(&runtime, keys.clone(), |key| {
+                        let engine = engine.clone();
+                        async move {
+                            let get = engine.get(key);
+                            get.await.unwrap();
+                        }
+                    })
                 },
-                |(notify, handle)| {
-                    notify.notify_waiters();
+                |(barrier, handle)| {
+                    runtime.block_on(barrier.wait());
                     runtime.block_on(handle).unwrap();
                 },
-                BatchSize::LargeInput,
             )
         });
     }
@@ -143,5 +158,5 @@ pub fn read_sled(c: &mut Criterion) {
     read_benchmark("read_sled", |path| SledKvsEngine::open(path).unwrap(), c)
 }
 
-criterion_group!(read, read_sled);
+criterion_group!(read, read_kvs, read_sled);
 criterion_main!(read);

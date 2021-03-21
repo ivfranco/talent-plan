@@ -447,12 +447,12 @@ impl Clone for LogKvsEngine {
 }
 
 impl KvsEngine for LogKvsEngine {
-    fn set(&self, key: String, value: String) -> BoxFuture<Result<()>> {
+    fn set(&self, key: String, value: String) -> BoxFuture<'static, Result<()>> {
         let engine = self.clone();
         futures::future::lazy(move |_| engine.set(key, value)).boxed()
     }
 
-    fn get(&self, key: String) -> BoxFuture<Result<Option<String>>> {
+    fn get(&self, key: String) -> BoxFuture<'static, Result<Option<String>>> {
         let engine = self.clone();
         futures::future::lazy(move |_| engine.get(key)).boxed()
 
@@ -462,7 +462,7 @@ impl KvsEngine for LogKvsEngine {
         // futures::future::lazy(|_|  Ok(Some("".to_string())) ).boxed()
     }
 
-    fn remove(&self, key: String) -> BoxFuture<Result<()>> {
+    fn remove(&self, key: String) -> BoxFuture<'static, Result<()>> {
         let engine = self.clone();
         futures::future::lazy(move |_| engine.remove(key)).boxed()
     }

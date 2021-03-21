@@ -78,3 +78,13 @@ Then we had `Future`.
 
 The introduction of lock-free readers made concurrent reads 5 times faster than the initial
 implementation that's a giant mutex locking everything.
+
+# Project 5
+
+In the latest release (v0.34.6 right now)
+[`sled::Tree::flush_async`](https://docs.rs/sled/0.34.6/sled/struct.Tree.html#method.flush_async)
+when called concurrently causes deadlock:
+
+https://github.com/spacejam/sled/issues/1308
+
+version of sled in Cargo.toml is locked to a recent commit that doesn't have this issue.
