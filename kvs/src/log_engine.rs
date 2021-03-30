@@ -1,6 +1,9 @@
 use crate::{Command, Corruption, Error, KvsEngine, Result};
 use dashmap::{lock::RwLockWriteGuard, DashMap};
-use futures::{future::BoxFuture, FutureExt};
+use futures::{
+    future::{self, BoxFuture},
+    FutureExt, TryFutureExt,
+};
 use std::{
     fmt::Debug,
     fs::{File, OpenOptions},
@@ -14,6 +17,7 @@ use std::{
 use tempfile::tempfile;
 
 const STORE_EXT: &str = "kvs";
+const COMPACTED_STORE: &str = "compacted";
 
 const MAX_SIZE: u64 = 1024 * 1024 /* one megabyte */;
 
@@ -92,7 +96,7 @@ impl KvStore {
 
     fn to_writer(&self) -> Result<KvsWriter> {
         Ok(KvsWriter {
-            epoch: self.reader.read()?.len() - 1,
+            epoch: self.stats.epoch(),
             stats: &self.stats,
             writer: self.writer.lock()?,
             indices: &self.indices,
@@ -106,21 +110,24 @@ impl KvStore {
     }
 
     fn advance_epoch(&self) -> Result<()> {
+        // assure exclusive access to the entire store
         let mut reader = self.reader.write()?;
         let mut writer = self.writer.lock()?;
 
         writer.flush()?;
 
-        let new_epoch = reader.len();
+        let new_epoch = self.stats.epoch();
         let mut file = OpenOptions::new()
             .create_new(true)
             .append(true)
             .open(self.dir.join(store_file_name(new_epoch)))?;
         let pos = file.stream_position()?;
-
         *writer = PBufWriter::new(file, pos);
 
         reader.push(File::open(self.dir.join(store_file_name(new_epoch)))?);
+
+        self.stats.set_epoch(new_epoch);
+        assert_eq!(self.stats.epoch() as usize, reader.len());
 
         Ok(())
     }
@@ -129,51 +136,13 @@ impl KvStore {
         self.stats.should_compact()
     }
 
-    fn compact(&self) -> Result<()> {
-        // info!("Compaction triggered");
-
-        // self.to_writer()?.flush()?;
-
-        // // lock both reader and writer, compact must have exclusive control over the store
-        // let mut reader = self.reader.write()?;
-        // let mut writer = self.writer.lock()?;
-
-        // // clear the indices, all values in it will be invalid after compaction
-        // let indices = self.indices.clone();
-        // self.indices.clear();
-
-        // // write only non-overwritten Get commands to the new file
-        // let mut backup = BufWriter::new(File::create(self.dir.join(BACKUP_NAME))?);
-        // for (key, span) in indices {
-        //     let value = read_value_from(&reader, span)?;
-        //     append(&mut backup, &Command::Set(key, value))?;
-        // }
-        // backup.flush()?;
-
-        // // drop the old file descriptors, otherwise renaming stores will cause permission error.
-        // let temp = tempfile()?;
-        // *reader = temp.try_clone()?;
-        // *writer = PBufWriter::new(temp, 0);
-
-        // std::fs::rename(self.dir.join(BACKUP_NAME), self.dir.join(STORE_NAME))?;
-
-        // // rebuild reader and writer
-        // let (write_fs, read_fs) = open_file(&self.dir)?;
-        // *reader = read_fs;
-        // *writer = write_fs;
-
-        // // rebuild indices and stats
-        // self.stats.clear();
-        // let entries = build_indices(&mut *reader, &self.stats)?;
-        // for (key, value) in entries {
-        //     self.indices.insert(key, value);
-        // }
-
-        // // sanity check
-        // assert!(1.0 - self.stats.utilization() < 1e-10);
-        // assert_eq!(self.indices.len(), self.logs() as usize);
-
-        Ok(())
+    fn to_compactor(&self) -> Result<KvsCompactor> {
+        Ok(KvsCompactor {
+            stats: &self.stats,
+            readers: self.reader.read()?,
+            indices: &self.indices,
+            dir: &self.dir,
+        })
     }
 }
 
@@ -331,9 +300,41 @@ impl<'a> Drop for KvsWriter<'a> {
 
 struct KvsCompactor<'a> {
     stats: &'a Stats,
-    reader: RwLockWriteGuard<'a, Vec<File>>,
-    writer: MutexGuard<'a, PBufWriter<File>>,
+    readers: RwLockReadGuard<'a, Vec<File>>,
     indices: &'a Indices,
+    dir: &'a Path,
+}
+
+impl<'a> KvsCompactor<'a> {
+    fn compact(&mut self) -> Result<()> {
+        self.stats.set_compact_state(COMPACT_STATE_ONGOING);
+
+        info!("Compaction triggered");
+
+        let epoch = self.stats.epoch();
+        // take a snapshot of the indices
+        let indices = self.indices.clone();
+        // leave the current epoch untouched, its content is instable
+        indices.retain(|_, span| span.epoch < epoch);
+
+        let compacted = File::create(self.dir.join(format!("{}.{}", COMPACTED_STORE, STORE_EXT)))?;
+        let mut writer = BufWriter::new(compacted);
+
+        for (key, span) in indices {
+            let Span { epoch, pos, len } = span;
+            let value = read_value_from(&self.readers[epoch], pos, len)?;
+            append(&mut writer, &Command::Set(key, value))?;
+        }
+
+        writer.flush()?;
+
+        self.stats.set_compact_state(COMPACT_STATE_READY);
+
+        // the scary part of compaction (rename files, redefine reader / writer) should be handled
+        // in the main thread, at here those operations may panic without immediately terminating
+        // the process
+        Ok(())
+    }
 }
 
 struct PBufWriter<W: Write> {
@@ -378,6 +379,7 @@ fn append<W: Write>(writer: W, command: &Command) -> Result<()> {
 const COMPACT_STATE_IDLE: u8 = 0;
 const COMPACT_STATE_ONGOING: u8 = 1;
 const COMPACT_STATE_READY: u8 = 2;
+const COMPACT_STATE_ERROR: u8 = 3;
 
 #[derive(Default)]
 struct Stats {
@@ -387,6 +389,8 @@ struct Stats {
     values: AtomicU32,
     // bytes in the write buffer.
     buf_len: AtomicUsize,
+    // current writing epoch
+    epoch: AtomicUsize,
     // state of the possibly ongoing compaction.
     compact_state: AtomicU8,
 }
@@ -418,7 +422,7 @@ impl Stats {
     }
 
     fn should_compact(&self) -> bool {
-        self.utilization() < 0.4 && self.logs() >= 100_000
+        self.utilization() < 0.4 && self.logs() >= 100_000 && self.epoch() >= 1
     }
 
     fn set_buf_len(&self, buf_len: usize) {
@@ -427,6 +431,14 @@ impl Stats {
 
     fn buf_len(&self) -> usize {
         self.buf_len.load(Ordering::Acquire)
+    }
+
+    fn set_epoch(&self, epoch: Epoch) {
+        self.epoch.store(epoch, Ordering::Release);
+    }
+
+    fn epoch(&self) -> Epoch {
+        self.epoch.load(Ordering::Acquire)
     }
 
     fn set_compact_state(&self, state: u8) {
@@ -502,33 +514,39 @@ impl LogKvsEngine {
         self.store.logs()
     }
 
-    fn set(&self, key: String, value: String) -> Result<()> {
-        let span = self.store.to_writer()?.set(key, value)?;
-
+    async fn clean_up(&self, span: Span) -> Result<()> {
         if span.should_advance() {
             self.store.advance_epoch()?;
         }
 
         if self.store.should_compact() {
-            self.store.compact()?;
+            let store = self.store.clone();
+            tokio::spawn(future::lazy(move |_| {
+                let mut compactor = store.to_compactor().unwrap();
+                if let Err(e) = compactor.compact() {
+                    eprintln!("{}", e);
+                    compactor.stats.set_compact_state(COMPACT_STATE_ERROR);
+                    // poison the read lock
+                    panic!();
+                }
+            }));
         }
+
         Ok(())
+    }
+
+    async fn set(&self, key: String, value: String) -> Result<()> {
+        let span = self.store.to_writer()?.set(key, value)?;
+        self.clean_up(span).await
     }
 
     fn get(&self, key: String) -> Result<Option<String>> {
         self.store.to_reader()?.get(key)
     }
 
-    fn remove(&self, key: String) -> Result<()> {
+    async fn remove(&self, key: String) -> Result<()> {
         let span = self.store.to_writer()?.remove(key)?;
-
-        if span.should_advance() {
-            self.store.advance_epoch()?;
-        }
-        if self.store.should_compact() {
-            self.store.compact()?;
-        }
-        Ok(())
+        self.clean_up(span).await
     }
 }
 
@@ -541,19 +559,17 @@ impl Clone for LogKvsEngine {
 }
 
 impl KvsEngine for LogKvsEngine {
-    fn set(&self, key: String, value: String) -> BoxFuture<'static, Result<()>> {
-        let engine = self.clone();
-        futures::future::lazy(move |_| engine.set(key, value)).boxed()
+    fn set(&self, key: String, value: String) -> BoxFuture<Result<()>> {
+        self.set(key, value).map_err(From::from).boxed()
     }
 
-    fn get(&self, key: String) -> BoxFuture<'static, Result<Option<String>>> {
+    fn get(&self, key: String) -> BoxFuture<Result<Option<String>>> {
         let engine = self.clone();
         futures::future::lazy(move |_| engine.get(key)).boxed()
     }
 
-    fn remove(&self, key: String) -> BoxFuture<'static, Result<()>> {
-        let engine = self.clone();
-        futures::future::lazy(move |_| engine.remove(key)).boxed()
+    fn remove(&self, key: String) -> BoxFuture<Result<()>> {
+        self.remove(key).map_err(From::from).boxed()
     }
 }
 
