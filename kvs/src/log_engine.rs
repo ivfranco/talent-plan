@@ -1,12 +1,12 @@
 use crate::{Command, Corruption, Error, KvsEngine, Result};
-use dashmap::{lock::RwLockWriteGuard, DashMap};
+use dashmap::DashMap;
 use futures::{
     future::{self, BoxFuture},
     FutureExt, TryFutureExt,
 };
 use std::{
     fmt::Debug,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
@@ -45,31 +45,8 @@ impl KvStore {
 
         let stats = Stats::default();
         let indices = Indices::new();
-        let mut epoch = 0;
-        let mut reader = vec![];
 
-        // update the indices and stats with all existing store files
-        loop {
-            let path = dir.join(store_file_name(epoch));
-            if !path.is_file() {
-                break;
-            }
-            let file = File::open(path)?;
-
-            update_indices(&file, &indices, epoch, &stats)?;
-            reader.push(file);
-
-            epoch += 1;
-        }
-
-        let writer = {
-            let last_epoch = reader.len().saturating_sub(1);
-            open_file(&dir, last_epoch)?
-        };
-
-        if reader.is_empty() {
-            reader.push(File::open(dir.join(store_file_name(0)))?);
-        }
+        let (reader, writer) = build_reader_writer(&dir, &indices, &stats)?;
 
         Ok(Self {
             stats,
@@ -110,13 +87,15 @@ impl KvStore {
     }
 
     fn advance_epoch(&self) -> Result<()> {
+        info!("Incrementing current epoch");
+
         // assure exclusive access to the entire store
         let mut reader = self.reader.write()?;
         let mut writer = self.writer.lock()?;
 
         writer.flush()?;
 
-        let new_epoch = self.stats.epoch();
+        let new_epoch = self.stats.epoch() + 1;
         let mut file = OpenOptions::new()
             .create_new(true)
             .append(true)
@@ -127,7 +106,7 @@ impl KvStore {
         reader.push(File::open(self.dir.join(store_file_name(new_epoch)))?);
 
         self.stats.set_epoch(new_epoch);
-        assert_eq!(self.stats.epoch() as usize, reader.len());
+        assert_eq!((self.stats.epoch() + 1) as usize, reader.len());
 
         Ok(())
     }
@@ -144,9 +123,54 @@ impl KvStore {
             dir: &self.dir,
         })
     }
+
+    fn apply_compaction(&self) -> Result<()> {
+        info!("Applying compaction");
+
+        // assure exclusive access to the entire store
+        let mut read_guard = self.reader.write()?;
+        let mut write_guard = self.writer.lock()?;
+
+        // drop all read file descriptors
+        read_guard.clear();
+        let last_epoch = self.stats.epoch();
+
+        // delete every old epoch except the current one
+        for epoch in 0..last_epoch {
+            fs::remove_file(self.dir.join(store_file_name(epoch)))?;
+        }
+
+        // rename the compacted store as 0.kvs, will not overwrite the current epoch as compaction
+        // may only be triggered when epoch >= 1
+        fs::rename(
+            self.dir.join(format!("{}.{}", COMPACTED_STORE, STORE_EXT)),
+            self.dir.join(store_file_name(0)),
+        )?;
+
+        // drop write file descriptor
+        *write_guard = PBufWriter::new(tempfile()?, 0);
+
+        fs::rename(
+            self.dir.join(store_file_name(last_epoch)),
+            self.dir.join(store_file_name(1)),
+        )?;
+
+        self.indices.clear();
+        self.stats.clear();
+
+        let (reader, writer) = build_reader_writer(&self.dir, &self.indices, &self.stats)?;
+        assert_eq!(reader.len(), 2);
+
+        *read_guard = reader;
+        *write_guard = writer;
+
+        self.stats.set_compact_state(COMPACT_STATE_IDLE);
+
+        Ok(())
+    }
 }
 
-fn open_file(dir: &Path, epoch: Epoch) -> Result<PBufWriter<File>> {
+fn open_writer(dir: &Path, epoch: Epoch) -> Result<PBufWriter<File>> {
     let path = dir.join(store_file_name(epoch));
 
     let mut write_fd = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -306,15 +330,18 @@ struct KvsCompactor<'a> {
 }
 
 impl<'a> KvsCompactor<'a> {
-    fn compact(&mut self) -> Result<()> {
+    fn compact(&self) -> Result<()> {
         self.stats.set_compact_state(COMPACT_STATE_ONGOING);
 
         info!("Compaction triggered");
 
-        let epoch = self.stats.epoch();
         // take a snapshot of the indices
         let indices = self.indices.clone();
-        // leave the current epoch untouched, its content is instable
+        // epoch may only be advanced when there's no other access to the store, as KvsCompactor
+        // holds a RwLockReadGuard the current epoch cannot change during the lifetime of the
+        // compactor
+        let epoch = self.stats.epoch();
+        // leave the current epoch untouched, its content is unstable
         indices.retain(|_, span| span.epoch < epoch);
 
         let compacted = File::create(self.dir.join(format!("{}.{}", COMPACTED_STORE, STORE_EXT)))?;
@@ -407,6 +434,7 @@ impl Stats {
         self.logs.store(0, Ordering::SeqCst);
         self.values.store(0, Ordering::SeqCst);
         self.buf_len.store(0, Ordering::SeqCst);
+        self.epoch.store(0, Ordering::SeqCst);
     }
 
     fn logs(&self) -> u32 {
@@ -453,6 +481,40 @@ impl Stats {
 
 type Indices = DashMap<String, Span>;
 
+fn build_reader_writer(
+    dir: &Path,
+    indices: &DashMap<String, Span>,
+    stats: &Stats,
+) -> Result<(Vec<File>, PBufWriter<File>)> {
+    let mut epoch = 0;
+    let mut reader = vec![];
+
+    // update the indices and stats with all existing store files
+    loop {
+        let path = dir.join(store_file_name(epoch));
+        if !path.is_file() {
+            break;
+        }
+        let file = File::open(path)?;
+
+        update_indices(&file, &indices, epoch, &stats)?;
+        reader.push(file);
+
+        epoch += 1;
+    }
+
+    let writer = {
+        let last_epoch = reader.len().saturating_sub(1);
+        open_writer(&dir, last_epoch)?
+    };
+
+    if reader.is_empty() {
+        reader.push(File::open(dir.join(store_file_name(0)))?);
+    }
+
+    Ok((reader, writer))
+}
+
 fn update_indices<R: Read>(
     reader: R,
     indices: &DashMap<String, Span>,
@@ -486,6 +548,8 @@ fn update_indices<R: Read>(
         }
     }
 
+    stats.set_epoch(epoch);
+
     Ok(())
 }
 
@@ -514,6 +578,14 @@ impl LogKvsEngine {
         self.store.logs()
     }
 
+    fn prepare(&self) -> Result<()> {
+        match self.store.stats.compact_state() {
+            COMPACT_STATE_IDLE | COMPACT_STATE_ONGOING => Ok(()),
+            COMPACT_STATE_READY => self.store.apply_compaction(),
+            _ => Err(Error::CompactionFailed),
+        }
+    }
+
     async fn clean_up(&self, span: Span) -> Result<()> {
         if span.should_advance() {
             self.store.advance_epoch()?;
@@ -521,30 +593,33 @@ impl LogKvsEngine {
 
         if self.store.should_compact() {
             let store = self.store.clone();
-            tokio::spawn(future::lazy(move |_| {
-                let mut compactor = store.to_compactor().unwrap();
+            tokio::spawn(async move {
+                let compactor = store.to_compactor().unwrap();
                 if let Err(e) = compactor.compact() {
                     eprintln!("{}", e);
                     compactor.stats.set_compact_state(COMPACT_STATE_ERROR);
                     // poison the read lock
                     panic!();
                 }
-            }));
+            });
         }
 
         Ok(())
     }
 
     async fn set(&self, key: String, value: String) -> Result<()> {
+        self.prepare()?;
         let span = self.store.to_writer()?.set(key, value)?;
         self.clean_up(span).await
     }
 
     fn get(&self, key: String) -> Result<Option<String>> {
+        self.prepare()?;
         self.store.to_reader()?.get(key)
     }
 
     async fn remove(&self, key: String) -> Result<()> {
+        self.prepare()?;
         let span = self.store.to_writer()?.remove(key)?;
         self.clean_up(span).await
     }

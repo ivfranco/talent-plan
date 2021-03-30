@@ -108,7 +108,7 @@ async fn remove_key() -> Result<()> {
 
 // Insert data until total size of the directory decreases.
 // Test data correctness after compaction.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn compaction() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let store = KvStore::open(temp_dir.path())?;

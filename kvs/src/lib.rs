@@ -69,6 +69,10 @@ pub enum Error {
     #[error("Failed to spawn threads on construction")]
     FailedToSpawn,
 
+    /// Compaction failed with possibly inconsistent file state.
+    #[error("Compaction failed")]
+    CompactionFailed,
+
     /// Other general unrecoverable errors.
     #[error("{0}")]
     Other(Box<dyn Display + Send + Sync>),
