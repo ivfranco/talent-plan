@@ -1,5 +1,5 @@
 use crate::{Command, Corruption, Error, KvsEngine, Result};
-use dashmap::DashMap;
+use dashmap::{lock::RwLockWriteGuard, DashMap};
 use futures::{future::BoxFuture, FutureExt};
 use std::{
     fmt::Debug,
@@ -7,24 +7,28 @@ use std::{
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard,
     },
 };
 use tempfile::tempfile;
 
+const STORE_EXT: &str = "kvs";
+
+const MAX_SIZE: u64 = 1024 * 1024 /* one megabyte */;
+
+fn store_file_name(epoch: Epoch) -> String {
+    format!("{}.{}", epoch, STORE_EXT)
+}
+
 /// commands are serialized to JSON for readability.
 struct KvStore {
     stats: Stats,
-    reader: RwLock<File>,
+    reader: RwLock<Vec<File>>,
     writer: Mutex<PBufWriter<File>>,
     indices: DashMap<String, Span>,
     dir: PathBuf,
 }
-
-/// The on-disk file name of the store.
-pub const STORE_NAME: &str = "0.kvs";
-const BACKUP_NAME: &str = "1.kvs";
 
 impl KvStore {
     fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
@@ -35,9 +39,33 @@ impl KvStore {
             return Err(Error::NotDirectory(dir));
         }
 
-        let (writer, mut reader) = open_file(&dir)?;
         let stats = Stats::default();
-        let indices = build_indices(&mut reader, &stats)?;
+        let indices = Indices::new();
+        let mut epoch = 0;
+        let mut reader = vec![];
+
+        // update the indices and stats with all existing store files
+        loop {
+            let path = dir.join(store_file_name(epoch));
+            if !path.is_file() {
+                break;
+            }
+            let file = File::open(path)?;
+
+            update_indices(&file, &indices, epoch, &stats)?;
+            reader.push(file);
+
+            epoch += 1;
+        }
+
+        let writer = {
+            let last_epoch = reader.len().saturating_sub(1);
+            open_file(&dir, last_epoch)?
+        };
+
+        if reader.is_empty() {
+            reader.push(File::open(dir.join(store_file_name(0)))?);
+        }
 
         Ok(Self {
             stats,
@@ -64,6 +92,7 @@ impl KvStore {
 
     fn to_writer(&self) -> Result<KvsWriter> {
         Ok(KvsWriter {
+            epoch: self.reader.read()?.len() - 1,
             stats: &self.stats,
             writer: self.writer.lock()?,
             indices: &self.indices,
@@ -76,79 +105,105 @@ impl KvStore {
         self.stats.logs()
     }
 
+    fn advance_epoch(&self) -> Result<()> {
+        let mut reader = self.reader.write()?;
+        let mut writer = self.writer.lock()?;
+
+        writer.flush()?;
+
+        let new_epoch = reader.len();
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(self.dir.join(store_file_name(new_epoch)))?;
+        let pos = file.stream_position()?;
+
+        *writer = PBufWriter::new(file, pos);
+
+        reader.push(File::open(self.dir.join(store_file_name(new_epoch)))?);
+
+        Ok(())
+    }
+
     fn should_compact(&self) -> bool {
         self.stats.should_compact()
     }
 
     fn compact(&self) -> Result<()> {
-        info!("Compaction triggered");
+        // info!("Compaction triggered");
 
-        self.to_writer()?.flush()?;
+        // self.to_writer()?.flush()?;
 
-        // lock both reader and writer, compact must have exclusive control over the store
-        let mut reader = self.reader.write()?;
-        let mut writer = self.writer.lock()?;
+        // // lock both reader and writer, compact must have exclusive control over the store
+        // let mut reader = self.reader.write()?;
+        // let mut writer = self.writer.lock()?;
 
-        // clear the indices, all values in it will be invalid after compaction
-        let indices = self.indices.clone();
-        self.indices.clear();
+        // // clear the indices, all values in it will be invalid after compaction
+        // let indices = self.indices.clone();
+        // self.indices.clear();
 
-        // write only non-overwritten Get commands to the new file
-        let mut backup = BufWriter::new(File::create(self.dir.join(BACKUP_NAME))?);
-        for (key, span) in indices {
-            let value = read_value_from(&reader, span)?;
-            append(&mut backup, &Command::Set(key, value))?;
-        }
-        backup.flush()?;
+        // // write only non-overwritten Get commands to the new file
+        // let mut backup = BufWriter::new(File::create(self.dir.join(BACKUP_NAME))?);
+        // for (key, span) in indices {
+        //     let value = read_value_from(&reader, span)?;
+        //     append(&mut backup, &Command::Set(key, value))?;
+        // }
+        // backup.flush()?;
 
-        // drop the old file descriptors, otherwise renaming stores will cause permission error.
-        let temp = tempfile()?;
-        *reader = temp.try_clone()?;
-        *writer = PBufWriter::new(temp, 0);
+        // // drop the old file descriptors, otherwise renaming stores will cause permission error.
+        // let temp = tempfile()?;
+        // *reader = temp.try_clone()?;
+        // *writer = PBufWriter::new(temp, 0);
 
-        std::fs::rename(self.dir.join(BACKUP_NAME), self.dir.join(STORE_NAME))?;
+        // std::fs::rename(self.dir.join(BACKUP_NAME), self.dir.join(STORE_NAME))?;
 
-        // rebuild reader and writer
-        let (write_fs, read_fs) = open_file(&self.dir)?;
-        *reader = read_fs;
-        *writer = write_fs;
+        // // rebuild reader and writer
+        // let (write_fs, read_fs) = open_file(&self.dir)?;
+        // *reader = read_fs;
+        // *writer = write_fs;
 
-        // rebuild indices and stats
-        self.stats.clear();
-        let entries = build_indices(&mut *reader, &self.stats)?;
-        for (key, value) in entries {
-            self.indices.insert(key, value);
-        }
+        // // rebuild indices and stats
+        // self.stats.clear();
+        // let entries = build_indices(&mut *reader, &self.stats)?;
+        // for (key, value) in entries {
+        //     self.indices.insert(key, value);
+        // }
 
-        // sanity check
-        assert!(1.0 - self.stats.utilization() < 1e-10);
-        assert_eq!(self.indices.len(), self.logs() as usize);
+        // // sanity check
+        // assert!(1.0 - self.stats.utilization() < 1e-10);
+        // assert_eq!(self.indices.len(), self.logs() as usize);
 
         Ok(())
     }
 }
 
-fn open_file(dir: &Path) -> Result<(PBufWriter<File>, File)> {
-    let path = dir.join(STORE_NAME);
+fn open_file(dir: &Path, epoch: Epoch) -> Result<PBufWriter<File>> {
+    let path = dir.join(store_file_name(epoch));
 
     let mut write_fd = OpenOptions::new().create(true).append(true).open(&path)?;
     let end = write_fd.seek(SeekFrom::End(0))?;
 
-    let read_fd = File::open(path)?;
-
-    Ok((PBufWriter::new(write_fd, end), read_fd))
+    Ok(PBufWriter::new(write_fd, end))
 }
+
+type Epoch = usize;
 
 #[derive(Debug, Clone, Copy)]
 struct Span {
+    epoch: Epoch,
     pos: u64,
     len: u64,
 }
 
-fn read_span(file: &File, span: Span) -> Result<Command> {
-    info!("Reading span: {:?}", span);
+impl Span {
+    fn should_advance(&self) -> bool {
+        self.pos + self.len > MAX_SIZE
+    }
+}
 
-    let Span { pos, len } = span;
+fn read_span(file: &File, pos: u64, len: u64) -> Result<Command> {
+    info!("Reading at: {}, {} bytes", pos, len);
+
     let mut buf = vec![0u8; len as usize];
     read_exact_at(file, &mut buf, pos)?;
 
@@ -185,7 +240,7 @@ fn read_exact_at(file: &File, buf: &mut [u8], pos: u64) -> io::Result<()> {
 
 struct KvsReader<'a> {
     indices: &'a Indices,
-    reader: RwLockReadGuard<'a, File>,
+    reader: RwLockReadGuard<'a, Vec<File>>,
 }
 
 impl<'a> KvsReader<'a> {
@@ -197,45 +252,44 @@ impl<'a> KvsReader<'a> {
             return Ok(None);
         };
 
-        read_value_from(&self.reader, span).map(Some)
+        read_value_from(&self.reader[span.epoch], span.pos, span.len).map(Some)
     }
 }
 
-fn read_value_from(file: &File, span: Span) -> Result<String> {
-    let value = match read_span(file, span)? {
+fn read_value_from(file: &File, pos: u64, len: u64) -> Result<String> {
+    let value = match read_span(file, pos, len)? {
         Command::Set(_, value) => value,
-        _ => return Err(Error::StoreFileCorrupted(span.pos, Corruption::HasNoValue)),
+        _ => return Err(Error::StoreFileCorrupted(pos, Corruption::HasNoValue)),
     };
 
     Ok(value)
 }
 
 struct KvsWriter<'a> {
+    epoch: Epoch,
     stats: &'a Stats,
     writer: MutexGuard<'a, PBufWriter<File>>,
     indices: &'a Indices,
 }
 
 impl<'a> KvsWriter<'a> {
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&mut self, key: String, value: String) -> Result<Span> {
         let span = self.append(&Command::Set(key.clone(), value))?;
-
         let is_overwrite = self.indices.insert(key, span).is_some();
         self.update_stats(is_overwrite);
 
-        Ok(())
+        Ok(span)
     }
 
-    fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&mut self, key: String) -> Result<Span> {
         if !self.indices.contains_key(&key) {
             Err(Error::KeyNotFound)
         } else {
             self.indices.remove(&key);
-            self.append(&Command::Remove(key))?;
-
+            let span = self.append(&Command::Remove(key))?;
             self.update_stats(true);
 
-            Ok(())
+            Ok(span)
         }
     }
 
@@ -250,7 +304,11 @@ impl<'a> KvsWriter<'a> {
         let pos = self.writer.pos();
         append(&mut *self.writer, command)?;
         let len = self.writer.pos() - pos;
-        Ok(Span { pos, len })
+        Ok(Span {
+            epoch: self.epoch,
+            pos,
+            len,
+        })
     }
 
     fn update_stats(&self, is_overwite: bool) {
@@ -269,6 +327,13 @@ impl<'a> Drop for KvsWriter<'a> {
         // KvsStore, hence `flush` must be called here.
         let _ = self.flush();
     }
+}
+
+struct KvsCompactor<'a> {
+    stats: &'a Stats,
+    reader: RwLockWriteGuard<'a, Vec<File>>,
+    writer: MutexGuard<'a, PBufWriter<File>>,
+    indices: &'a Indices,
 }
 
 struct PBufWriter<W: Write> {
@@ -310,6 +375,10 @@ fn append<W: Write>(writer: W, command: &Command) -> Result<()> {
     Ok(())
 }
 
+const COMPACT_STATE_IDLE: u8 = 0;
+const COMPACT_STATE_ONGOING: u8 = 1;
+const COMPACT_STATE_READY: u8 = 2;
+
 #[derive(Default)]
 struct Stats {
     // The number of logs on disk.
@@ -318,6 +387,8 @@ struct Stats {
     values: AtomicU32,
     // bytes in the write buffer.
     buf_len: AtomicUsize,
+    // state of the possibly ongoing compaction.
+    compact_state: AtomicU8,
 }
 
 impl Stats {
@@ -357,20 +428,34 @@ impl Stats {
     fn buf_len(&self) -> usize {
         self.buf_len.load(Ordering::Acquire)
     }
+
+    fn set_compact_state(&self, state: u8) {
+        assert!(state <= COMPACT_STATE_READY);
+        self.compact_state.store(state, Ordering::Release);
+    }
+
+    fn compact_state(&self) -> u8 {
+        self.compact_state.load(Ordering::Acquire)
+    }
 }
 
 type Indices = DashMap<String, Span>;
 
-fn build_indices<R: Read>(reader: R, stats: &Stats) -> Result<Indices> {
-    let mut de = serde_json::Deserializer::from_reader(BufReader::new(reader)).into_iter();
-    let indices = DashMap::new();
+fn update_indices<R: Read>(
+    reader: R,
+    indices: &DashMap<String, Span>,
+    epoch: Epoch,
+    stats: &Stats,
+) -> Result<()> {
+    let reader = BufReader::new(reader);
+    let mut de = serde_json::Deserializer::from_reader(reader).into_iter();
 
     loop {
         let pos = de.byte_offset() as u64;
         match de.next().transpose()? {
             Some(Command::Set(key, _)) => {
                 let len = de.byte_offset() as u64 - pos;
-                let is_overwrite = indices.insert(key, Span { pos, len }).is_some();
+                let is_overwrite = indices.insert(key, Span { epoch, pos, len }).is_some();
                 stats.update(is_overwrite);
             }
             Some(Command::Remove(key)) => {
@@ -389,7 +474,7 @@ fn build_indices<R: Read>(reader: R, stats: &Stats) -> Result<Indices> {
         }
     }
 
-    Ok(indices)
+    Ok(())
 }
 
 /// Sharable [KvStore](KvStore).
@@ -409,7 +494,7 @@ impl LogKvsEngine {
     /// Test whether log engine is persistent under the given directory.
     pub fn is_persistent<P: AsRef<Path>>(path: P) -> bool {
         let path = path.as_ref();
-        path.is_dir() && path.join(STORE_NAME).is_file()
+        path.is_dir() && path.join(store_file_name(0)).is_file()
     }
 
     /// Exposed for tests.
@@ -418,7 +503,12 @@ impl LogKvsEngine {
     }
 
     fn set(&self, key: String, value: String) -> Result<()> {
-        self.store.to_writer()?.set(key, value)?;
+        let span = self.store.to_writer()?.set(key, value)?;
+
+        if span.should_advance() {
+            self.store.advance_epoch()?;
+        }
+
         if self.store.should_compact() {
             self.store.compact()?;
         }
@@ -430,7 +520,11 @@ impl LogKvsEngine {
     }
 
     fn remove(&self, key: String) -> Result<()> {
-        self.store.to_writer()?.remove(key)?;
+        let span = self.store.to_writer()?.remove(key)?;
+
+        if span.should_advance() {
+            self.store.advance_epoch()?;
+        }
         if self.store.should_compact() {
             self.store.compact()?;
         }
@@ -455,11 +549,6 @@ impl KvsEngine for LogKvsEngine {
     fn get(&self, key: String) -> BoxFuture<'static, Result<Option<String>>> {
         let engine = self.clone();
         futures::future::lazy(move |_| engine.get(key)).boxed()
-
-        // this doesn't make any sense at all, doing no search is about twice as slow as the current
-        // implementation of get that doesn't have a cache yet
-        //
-        // futures::future::lazy(|_|  Ok(Some("".to_string())) ).boxed()
     }
 
     fn remove(&self, key: String) -> BoxFuture<'static, Result<()>> {
