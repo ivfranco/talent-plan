@@ -20,9 +20,9 @@ prost = "0.6"
 prost-derive = "0.6"
 rand = "0.7"
 
-labcodec = { path = "../labcodec" }
-labrpc = { path = "../labrpc" }
-linearizability = { path = "../linearizability"}
+labcodec = { git = "https://github.com/pingcap/talent-plan", rev = "23263a3" }
+labrpc = { git = "https://github.com/pingcap/talent-plan", rev = "23263a3" }
+linearizability = { git = "https://github.com/pingcap/talent-plan", rev = "23263a3" }
 
 [dev-dependencies]
 env_logger = "0.7"
