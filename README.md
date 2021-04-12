@@ -1,3 +1,5 @@
 # talent-plan
 
-Working repo of [Pingcap rust talent plan](https://github.com/pingcap/talent-plan/blob/master/courses/rust/docs/lesson-plan.md#user-content-making-pna-rust-better).
+Working repo of PingCAP talent plan courses:
+- [Practical Networked Applications in Rust](https://github.com/pingcap/talent-plan/blob/master/courses/rust/README.md)
+- [Distributed Systems in Rust](https://github.com/pingcap/talent-plan/blob/master/courses/dss/README.md)
