@@ -1,9 +1,0 @@
-**/target
-**/*.rs.bk
-6.824-golabs-2018
-
-# unmodified, copy from the original repo
-labcodec/
-labrpc/
-linearizability/
-percolator/
